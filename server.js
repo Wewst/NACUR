@@ -140,15 +140,14 @@ app.get('/api/health', (req, res) => {
 // Получение всех участников
 app.get('/api/users', async (req, res) => {
     try {
-        // Обновляем список участников при каждом запросе
-        await updateUsers();
-        
+        // Возвращаем сохраненных пользователей (они собираются через webhook)
         // Фильтруем админов
         const filteredUsers = data.users.filter(user => {
             const userId = String(user.id || user.chat_id);
             return !CONFIG.ADMIN_CHAT_IDS.includes(userId);
         });
 
+        console.log(`Возвращаем ${filteredUsers.length} пользователей`);
         res.json(filteredUsers);
     } catch (error) {
         console.error('Ошибка получения пользователей:', error);
@@ -227,6 +226,7 @@ app.post('/api/users/update', async (req, res) => {
 app.post('/webhook', async (req, res) => {
     try {
         const update = req.body;
+        let usersUpdated = false;
 
         // Обработка новых участников группы
         if (update.message?.new_chat_members) {
@@ -243,14 +243,15 @@ app.post('/webhook', async (req, res) => {
                             username: member.username || null,
                             photo_100: null
                         });
+                        usersUpdated = true;
+                        console.log(`Добавлен новый участник: ${member.first_name} ${member.last_name || ''} (${userId})`);
                     }
                 }
             }
-            await saveData();
         }
 
         // Обработка сообщений для сбора участников
-        if (update.message?.from) {
+        if (update.message?.from && update.message?.chat?.id === CONFIG.GROUP_CHAT_ID) {
             const member = update.message.from;
             const userId = String(member.id);
             if (!CONFIG.ADMIN_CHAT_IDS.includes(userId)) {
@@ -264,15 +265,28 @@ app.post('/webhook', async (req, res) => {
                         username: member.username || null,
                         photo_100: null
                     });
-                    await saveData();
+                    usersUpdated = true;
+                    console.log(`Добавлен участник из сообщения: ${member.first_name} ${member.last_name || ''} (${userId})`);
                 } else {
                     // Обновляем информацию о существующем пользователе
-                    existingUser.first_name = member.first_name || existingUser.first_name;
-                    existingUser.last_name = member.last_name || existingUser.last_name;
-                    existingUser.username = member.username || existingUser.username;
-                    await saveData();
+                    const updated = 
+                        existingUser.first_name !== member.first_name ||
+                        existingUser.last_name !== (member.last_name || '') ||
+                        existingUser.username !== (member.username || null);
+                    
+                    if (updated) {
+                        existingUser.first_name = member.first_name || existingUser.first_name;
+                        existingUser.last_name = member.last_name || existingUser.last_name;
+                        existingUser.username = member.username || existingUser.username;
+                        usersUpdated = true;
+                    }
                 }
             }
+        }
+
+        if (usersUpdated) {
+            await saveData();
+            console.log(`Всего участников в базе: ${data.users.length}`);
         }
 
         res.json({ ok: true });
