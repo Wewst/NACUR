@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs').promises;
-const fsSync = require('fs');
 const path = require('path');
 
 const app = express();
@@ -18,68 +17,27 @@ const CONFIG = {
 
 // Middleware
 app.use(cors({
-    origin: '*',
+    origin: '*', // Разрешаем запросы с любого домена (Vercel)
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
 }));
 app.use(express.json());
 
-// Обслуживание статических файлов (для фронтенда)
-app.use(express.static(__dirname));
-
-// Корневой маршрут - отдаем index.html
+// Корневой маршрут - информация об API
 app.get('/', (req, res) => {
-    // Пробуем разные возможные пути
-    const possiblePaths = [
-        path.join(__dirname, 'index.html'),
-        path.join(process.cwd(), 'index.html'),
-        path.join(__dirname, '..', 'index.html'),
-        path.join(process.cwd(), 'src', 'index.html')
-    ];
-    
-    let fileSent = false;
-    for (const filePath of possiblePaths) {
-        try {
-            if (fsSync.existsSync(filePath)) {
-                console.log(`Найден index.html по пути: ${filePath}`);
-                res.sendFile(filePath);
-                fileSent = true;
-                break;
-            }
-        } catch (e) {
-            continue;
+    res.json({
+        name: 'NAKUR SYSTEM API',
+        version: '1.0.0',
+        status: 'running',
+        endpoints: {
+            users: '/api/users',
+            reviews: '/api/reviews',
+            updateUsers: '/api/users/update',
+            addUser: '/api/users/add',
+            webhook: '/webhook'
         }
-    }
-    
-    if (!fileSent) {
-        console.error('index.html не найден в следующих путях:', possiblePaths);
-        console.log('__dirname:', __dirname);
-        console.log('process.cwd():', process.cwd());
-        res.status(404).send(`
-            <!DOCTYPE html>
-            <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <title>NAKUR SYSTEM - Ошибка</title>
-                    <style>
-                        body {
-                            background: #000;
-                            color: #fff;
-                            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-                            padding: 40px;
-                            text-align: center;
-                        }
-                    </style>
-                </head>
-                <body>
-                    <h1>NAKUR SYSTEM</h1>
-                    <p>Файл index.html не найден. Проверьте структуру проекта.</p>
-                    <p>Текущая директория: ${__dirname}</p>
-                    <p>Рабочая директория: ${process.cwd()}</p>
-                </body>
-            </html>
-        `);
-    }
+    });
 });
 
 // Инициализация данных
@@ -169,6 +127,15 @@ async function updateUsers() {
 }
 
 // API Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
 
 // Получение всех участников
 app.get('/api/users', async (req, res) => {
