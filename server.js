@@ -16,8 +16,20 @@ const CONFIG = {
 };
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
+
+// Обслуживание статических файлов (для фронтенда)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Корневой маршрут - отдаем index.html
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 // Инициализация данных
 let data = {
