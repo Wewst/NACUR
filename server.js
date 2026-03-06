@@ -230,14 +230,14 @@ function persistData() {
     fs.writeFile(DATA_FILE, JSON.stringify(memory, null, 2), "utf8", (error) => {
       if (error) console.error("Failed to persist data:", error.message);
     });
-  }, 120);
+  }, 40);
 }
 
 function scheduleBootstrap() {
   if (!BOT_TOKEN || !CHAT_ID) return;
   setTimeout(() => {
     bootstrapBotState().catch((error) => console.error("Bootstrap failed:", error.message));
-  }, 1000);
+  }, 300);
 }
 
 async function bootstrapBotState() {
