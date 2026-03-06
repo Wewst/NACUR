@@ -12,6 +12,9 @@ const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
 const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 10);
 const COMMENTS_MAX_LEN = 280;
+const VOTE_MIN_INTERVAL_MS = Number(process.env.VOTE_MIN_INTERVAL_MS || 1200);
+const HIGH_ACTIVITY_DAILY = Number(process.env.HIGH_ACTIVITY_DAILY || 80);
+const EXTREME_ACTIVITY_DAILY = Number(process.env.EXTREME_ACTIVITY_DAILY || 120);
 const TELEGRAM_MODE = String(process.env.TELEGRAM_MODE || "webhook").toLowerCase();
 const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "");
 const DEFAULT_WEBHOOK_BASE_URL = "https://nacur.onrender.com";
@@ -21,6 +24,13 @@ const WEBHOOK_BASE_URL = String(
   process.env.RENDER_EXTERNAL_URL ||
   ""
 ).trim();
+const REPUTATION_CATEGORIES = ["reliability", "response", "product", "communication"];
+const CATEGORY_LABELS = {
+  reliability: "Надежность",
+  response: "Скорость ответа",
+  product: "Качество товара",
+  communication: "Коммуникация"
+};
 
 const runtime = {
   botUserId: "",
@@ -57,7 +67,8 @@ const server = http.createServer(async (req, res) => {
         spamWindowMs: SPAM_WINDOW_MS,
         hasBot: Boolean(BOT_TOKEN && CHAT_ID),
         botUserId: runtime.botUserId || null,
-        telegramMode: TELEGRAM_MODE
+        telegramMode: TELEGRAM_MODE,
+        categories: CATEGORY_LABELS
       });
     }
 
@@ -288,6 +299,74 @@ function normalizeTelegramName(input, username) {
   return username;
 }
 
+function getEmptyReputation() {
+  return {
+    reliability: { likes: 0, dislikes: 0, weighted_score: 0 },
+    response: { likes: 0, dislikes: 0, weighted_score: 0 },
+    product: { likes: 0, dislikes: 0, weighted_score: 0 },
+    communication: { likes: 0, dislikes: 0, weighted_score: 0 }
+  };
+}
+
+function normalizeCategory(input) {
+  const category = String(input || "").trim().toLowerCase();
+  return REPUTATION_CATEGORIES.includes(category) ? category : "reliability";
+}
+
+function ensureUserReputation(user) {
+  if (!user.reputation || typeof user.reputation !== "object") {
+    user.reputation = getEmptyReputation();
+    const baseLikes = Number(user.likes || 0);
+    const baseDislikes = Number(user.dislikes || 0);
+    user.reputation.reliability.likes = baseLikes;
+    user.reputation.reliability.dislikes = baseDislikes;
+    user.reputation.reliability.weighted_score = Number(user.score || baseLikes - baseDislikes);
+  }
+  for (const category of REPUTATION_CATEGORIES) {
+    if (!user.reputation[category]) {
+      user.reputation[category] = { likes: 0, dislikes: 0, weighted_score: 0 };
+    }
+    user.reputation[category].likes = Number(user.reputation[category].likes || 0);
+    user.reputation[category].dislikes = Number(user.reputation[category].dislikes || 0);
+    user.reputation[category].weighted_score = Number(user.reputation[category].weighted_score || 0);
+  }
+}
+
+function recalcUserTotals(user) {
+  ensureUserReputation(user);
+  let likes = 0;
+  let dislikes = 0;
+  let weighted = 0;
+  for (const category of REPUTATION_CATEGORIES) {
+    likes += Number(user.reputation[category].likes || 0);
+    dislikes += Number(user.reputation[category].dislikes || 0);
+    weighted += Number(user.reputation[category].weighted_score || 0);
+  }
+  user.likes = likes;
+  user.dislikes = dislikes;
+  user.score = Number(weighted.toFixed(2));
+}
+
+function buildBadges(user) {
+  const badges = [];
+  if (Number(user.score || 0) >= 20) badges.push("Топ доверия");
+  if (Number(user.likes || 0) >= 15 && Number(user.dislikes || 0) <= 2) badges.push("Проверенный");
+  if (Number(user.dislikes || 0) === 0 && Number(user.likes || 0) >= 8) badges.push("Чистая репутация");
+  const communicationScore = Number(user?.reputation?.communication?.weighted_score || 0);
+  if (communicationScore >= 6) badges.push("Коммуникабельный");
+  return badges;
+}
+
+function presentUser(user) {
+  if (!user) return null;
+  ensureUserReputation(user);
+  recalcUserTotals(user);
+  return {
+    ...user,
+    badges: buildBadges(user)
+  };
+}
+
 async function upsertUser(input, options = {}) {
   const telegramId = String(input?.telegram_id ?? input?.telegramId ?? "").trim();
   if (!telegramId) return null;
@@ -301,7 +380,8 @@ async function upsertUser(input, options = {}) {
     avatar: "",
     likes: 0,
     dislikes: 0,
-    score: 0
+    score: 0,
+    reputation: getEmptyReputation()
   };
 
   const username = normalizeUsername(input.username || current.username, telegramId);
@@ -314,6 +394,8 @@ async function upsertUser(input, options = {}) {
     telegram_name: telegramName,
     avatar: avatarIncoming
   };
+  ensureUserReputation(updated);
+  recalcUserTotals(updated);
   memory.usersByTelegramId[telegramId] = updated;
 
   const needsAvatar = options.fetchAvatar !== false && !updated.avatar;
@@ -344,7 +426,7 @@ function getRatedUsersSorted() {
     if (b.likes !== a.likes) return b.likes - a.likes;
     return a.dislikes - b.dislikes;
   });
-  return rated;
+  return rated.map((user) => presentUser(user));
 }
 
 function getAllUsersSorted(options = {}) {
@@ -361,28 +443,52 @@ function getAllUsersSorted(options = {}) {
     if (b.likes !== a.likes) return b.likes - a.likes;
     return a.dislikes - b.dislikes;
   });
-  return all;
+  return all.map((user) => presentUser(user));
 }
 
 function ensureVoterActivity(voterTelegramId) {
   if (!memory.voterActivity[voterTelegramId]) {
-    memory.voterActivity[voterTelegramId] = { timestamps: [], warned: false, blocked: false };
+    memory.voterActivity[voterTelegramId] = {
+      timestamps: [],
+      warned: false,
+      blocked: false,
+      lastVoteAt: 0,
+      dailyKey: "",
+      dailyCount: 0
+    };
   }
   return memory.voterActivity[voterTelegramId];
 }
 
-function applyUserCounters(user, voteType, delta) {
-  if (voteType === "like") user.likes = Math.max(0, Number(user.likes || 0) + delta);
-  if (voteType === "dislike") user.dislikes = Math.max(0, Number(user.dislikes || 0) + delta);
-  user.score = Number(user.likes || 0) - Number(user.dislikes || 0);
+function applyUserCounters(user, voteType, delta, category, weight) {
+  ensureUserReputation(user);
+  const safeCategory = normalizeCategory(category);
+  const safeWeight = Number(weight || 1);
+  const target = user.reputation[safeCategory];
+  if (voteType === "like") target.likes = Math.max(0, Number(target.likes || 0) + delta);
+  if (voteType === "dislike") target.dislikes = Math.max(0, Number(target.dislikes || 0) + delta);
+  const scoreSign = voteType === "like" ? 1 : -1;
+  target.weighted_score = Number(target.weighted_score || 0) + scoreSign * safeWeight * delta;
+  recalcUserTotals(user);
 }
 
 async function checkAndHandleSpam(voterUser) {
   const voterId = String(voterUser.telegram_id);
   const activity = ensureVoterActivity(voterId);
   const now = Date.now();
+  const dayKey = new Date(now).toISOString().slice(0, 10);
+  if (activity.dailyKey !== dayKey) {
+    activity.dailyKey = dayKey;
+    activity.dailyCount = 0;
+  }
+  if (now - Number(activity.lastVoteAt || 0) < VOTE_MIN_INTERVAL_MS) {
+    return { warning: false, blocked: false, cooldown: true, qualityFactor: 1 };
+  }
+
   activity.timestamps = activity.timestamps.filter((ts) => now - ts <= SPAM_WINDOW_MS);
   activity.timestamps.push(now);
+  activity.lastVoteAt = now;
+  activity.dailyCount = Number(activity.dailyCount || 0) + 1;
 
   let warning = false;
   if (activity.timestamps.length > SPAM_LIMIT) {
@@ -394,13 +500,17 @@ async function checkAndHandleSpam(voterUser) {
       await banUserFromGroup(voterId);
     }
   }
-  return { warning, blocked: activity.blocked };
+  let qualityFactor = 1;
+  if (activity.dailyCount > HIGH_ACTIVITY_DAILY) qualityFactor = 0.75;
+  if (activity.dailyCount > EXTREME_ACTIVITY_DAILY) qualityFactor = 0.55;
+  return { warning, blocked: activity.blocked, cooldown: false, qualityFactor };
 }
 
 async function applyVote(body) {
   const voterTelegramId = String(body?.voterTelegramId || body?.voter_telegram_id || "").trim();
   const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
   const voteType = String(body?.type || "").trim();
+  const category = normalizeCategory(body?.category || body?.voteCategory);
   const voterUsername = String(body?.voterUsername || body?.voter_username || "").trim();
   const targetUsername = String(body?.targetUsername || body?.target_username || "").trim();
   const voterAvatar = String(body?.voterAvatar || body?.voter_avatar || "").trim();
@@ -431,34 +541,44 @@ async function applyVote(body) {
   if (!voterUser || !targetUser) throw new Error("Invalid voter or target user");
 
   const antiSpam = await checkAndHandleSpam(voterUser);
+  if (antiSpam.cooldown) {
+    return { ok: false, cooldown: true, message: "Too fast. Please wait a second between votes." };
+  }
   if (antiSpam.blocked) {
     persistData();
     return { ok: false, blocked: true, message: "Voting blocked due to suspicious mass activity." };
   }
 
-  const key = `${voterTelegramId}:${targetTelegramId}`;
-  const existing = memory.votesByPair[key];
+  const key = `${voterTelegramId}:${targetTelegramId}:${category}`;
+  const legacyKey = `${voterTelegramId}:${targetTelegramId}`;
+  const existing = memory.votesByPair[key] || (category === "reliability" ? memory.votesByPair[legacyKey] : null);
   const isFirstVoteEver = countVoterVotes(voterTelegramId) === 0;
+  const voteWeight = Number(antiSpam.qualityFactor || 1);
 
   if (!existing) {
     memory.votesByPair[key] = {
       voterTelegramId,
       targetTelegramId,
+      category,
       value: voteType,
+      weight: voteWeight,
       changedOnce: false,
       createdAt: Date.now(),
       updatedAt: Date.now()
     };
-    applyUserCounters(targetUser, voteType, +1);
+    applyUserCounters(targetUser, voteType, +1, category, voteWeight);
     persistData();
     return {
       ok: true,
       changed: false,
       warning: antiSpam.warning,
       user: targetUser,
+      category,
       noticeCode: isFirstVoteEver ? "first_vote" : null
     };
   }
+  if (!existing.category) existing.category = "reliability";
+  if (!existing.weight) existing.weight = 1;
 
   if (existing.value === voteType) {
     return {
@@ -466,6 +586,7 @@ async function applyVote(body) {
       unchanged: true,
       warning: antiSpam.warning,
       message: "Vote already set",
+      category,
       noticeCode: "same_vote"
     };
   }
@@ -473,8 +594,10 @@ async function applyVote(body) {
     return { ok: false, locked: true, warning: antiSpam.warning, message: "Vote already changed once" };
   }
 
-  applyUserCounters(targetUser, existing.value, -1);
-  applyUserCounters(targetUser, voteType, +1);
+  applyUserCounters(targetUser, existing.value, -1, existing.category, existing.weight);
+  applyUserCounters(targetUser, voteType, +1, category, voteWeight);
+  existing.category = category;
+  existing.weight = voteWeight;
   existing.value = voteType;
   existing.changedOnce = true;
   existing.updatedAt = Date.now();
@@ -484,6 +607,7 @@ async function applyVote(body) {
     changed: true,
     warning: antiSpam.warning,
     user: targetUser,
+    category,
     noticeCode: "final_change"
   };
 }
@@ -513,7 +637,27 @@ function getUserProfile(targetTelegramId, viewerTelegramId) {
   const canEdit = Boolean(state && !state.changedOnce);
   const canCreate = Boolean(viewerTelegramId && viewerTelegramId !== targetTelegramId && !state);
   const canComment = canCreate || canEdit;
-  return { user, comments, canComment, canEdit, ownComment };
+  return {
+    user: presentUser(user),
+    comments,
+    canComment,
+    canEdit,
+    ownComment,
+    transparency: getTransparencyBlock(viewerTelegramId)
+  };
+}
+
+function getTransparencyBlock(viewerTelegramId) {
+  const activity = viewerTelegramId ? ensureVoterActivity(String(viewerTelegramId)) : null;
+  const qualityPreview = activity
+    ? (activity.dailyCount > EXTREME_ACTIVITY_DAILY ? 0.55 : activity.dailyCount > HIGH_ACTIVITY_DAILY ? 0.75 : 1)
+    : 1;
+  return {
+    categories: CATEGORY_LABELS,
+    oneChangeRule: "Каждую оценку можно изменить только один раз",
+    qualityRule: "Чрезмерная активность снижает вес оценки и может привести к блокировке",
+    qualityPreview
+  };
 }
 
 async function addComment(body) {
