@@ -1,361 +1,375 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const fs = require('fs').promises;
-const path = require('path');
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { URL } = require("url");
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const BOT_TOKEN = process.env.BOT_TOKEN || "8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE";
+const CHAT_ID = process.env.CHAT_ID || "-5293585696";
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+const DATA_FILE = path.join(__dirname, "data.json");
+const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
+const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 10);
 
-// Конфигурация
-const CONFIG = {
-    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE', // Токен бота
-    GROUP_CHAT_ID: '-5293585696', // ID группы
-    ADMIN_CHAT_IDS: ['920945194', '8050542983'],
-    DATA_FILE: path.join(__dirname, 'data.json')
-};
+const memory = loadData();
+scheduleAutoSyncFromTelegram();
 
-// Middleware
-app.use(cors({
-    origin: '*', // Разрешаем запросы с любого домена (Vercel)
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
-}));
-app.use(express.json());
+const server = http.createServer(async (req, res) => {
+  setCorsHeaders(res);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
-// Корневой маршрут - информация об API
-app.get('/', (req, res) => {
-    res.json({
-        name: 'NAKUR SYSTEM API',
-        version: '1.0.0',
-        status: 'running',
-        endpoints: {
-            users: '/api/users',
-            reviews: '/api/reviews',
-            updateUsers: '/api/users/update',
-            addUser: '/api/users/add',
-            webhook: '/webhook'
-        }
-    });
+  const parsed = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = parsed.pathname;
+
+  try {
+    if (pathname === "/health" && req.method === "GET") {
+      return sendJson(res, 200, { ok: true, uptimeSec: Math.floor(process.uptime()) });
+    }
+
+    if (pathname === "/api/users" && req.method === "GET") {
+      return sendJson(res, 200, { users: getSortedUsers() });
+    }
+
+    if (pathname === "/api/leaderboard" && req.method === "GET") {
+      const users = getSortedUsers();
+      return sendJson(res, 200, {
+        top: users.slice(0, 3),
+        bottom: [...users].reverse().slice(0, 3)
+      });
+    }
+
+    if (pathname === "/api/config" && req.method === "GET") {
+      return sendJson(res, 200, {
+        spamLimit: SPAM_LIMIT,
+        spamWindowMs: SPAM_WINDOW_MS,
+        hasBot: Boolean(BOT_TOKEN && CHAT_ID)
+      });
+    }
+
+    if (pathname === "/api/users/sync" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const count = syncUsersFromPayload(body);
+      persistData();
+      return sendJson(res, 200, { ok: true, upserted: count, users: getSortedUsers() });
+    }
+
+    if (pathname === "/api/telegram/sync" && req.method === "POST") {
+      const result = await syncFromTelegramBotApi();
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/vote" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = await applyVote(body);
+      return sendJson(res, 200, result);
+    }
+
+    sendJson(res, 404, { ok: false, error: "Not found" });
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: error.message || "Request failed" });
+  }
 });
 
-// Инициализация данных
-let data = {
-    users: [],
-    reviews: {}
-};
+server.listen(PORT, () => {
+  console.log(`NAKUR backend listening on port ${PORT}`);
+});
 
-// Загрузка данных из файла
-async function loadData() {
-    try {
-        const fileData = await fs.readFile(CONFIG.DATA_FILE, 'utf8');
-        data = JSON.parse(fileData);
-    } catch (error) {
-        console.log('Создание нового файла данных...');
-        await saveData();
-    }
+function setCorsHeaders(res) {
+  res.setHeader("Access-Control-Allow-Origin", FRONTEND_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// Сохранение данных в файл
-async function saveData() {
-    try {
-        await fs.writeFile(CONFIG.DATA_FILE, JSON.stringify(data, null, 2));
-    } catch (error) {
-        console.error('Ошибка сохранения данных:', error);
-    }
+function sendJson(res, code, payload) {
+  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
 }
 
-// Получение участников группы из Telegram
-async function fetchGroupMembers() {
-    if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-        console.warn('Токен бота не указан. Используются пустые данные.');
-        return [];
-    }
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1_000_000) {
+        reject(new Error("Payload too large"));
+      }
+    });
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch (error) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
-    try {
-        // Получаем администраторов группы
-        let adminIds = [];
+function loadData() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      return {
+        usersByTelegramId: {},
+        votesByPair: {},
+        voterActivity: {}
+      };
+    }
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    return {
+      usersByTelegramId: parsed.usersByTelegramId || {},
+      votesByPair: parsed.votesByPair || {},
+      voterActivity: parsed.voterActivity || {}
+    };
+  } catch (error) {
+    console.error("Failed to read data file, starting with empty state", error);
+    return { usersByTelegramId: {}, votesByPair: {}, voterActivity: {} };
+  }
+}
+
+let writeTimer = null;
+function persistData() {
+  clearTimeout(writeTimer);
+  writeTimer = setTimeout(() => {
+    fs.writeFile(DATA_FILE, JSON.stringify(memory, null, 2), "utf8", (error) => {
+      if (error) console.error("Failed to persist data:", error);
+    });
+  }, 100);
+}
+
+function upsertUser(input) {
+  const telegramId = String(input.telegram_id ?? input.telegramId ?? "").trim();
+  if (!telegramId) return null;
+
+  const current = memory.usersByTelegramId[telegramId] || {
+    id: `usr_${telegramId}`,
+    telegram_id: telegramId,
+    username: `user_${telegramId}`,
+    avatar: "",
+    likes: 0,
+    dislikes: 0,
+    score: 0
+  };
+
+  const username = String(input.username || current.username || `user_${telegramId}`).replace(/^@/, "");
+  const avatar = typeof input.avatar === "string" ? input.avatar : current.avatar;
+
+  memory.usersByTelegramId[telegramId] = {
+    ...current,
+    username,
+    avatar
+  };
+  return memory.usersByTelegramId[telegramId];
+}
+
+function syncUsersFromPayload(body) {
+  const items = Array.isArray(body?.users) ? body.users : [];
+  let upserted = 0;
+  for (const item of items) {
+    if (upsertUser(item)) upserted += 1;
+  }
+  return upserted;
+}
+
+function getSortedUsers() {
+  const users = Object.values(memory.usersByTelegramId);
+  return users.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.likes !== a.likes) return b.likes - a.likes;
+    return a.dislikes - b.dislikes;
+  });
+}
+
+function ensureVoterActivity(voterTelegramId) {
+  if (!memory.voterActivity[voterTelegramId]) {
+    memory.voterActivity[voterTelegramId] = { timestamps: [], warned: false, blocked: false };
+  }
+  return memory.voterActivity[voterTelegramId];
+}
+
+async function applyVote(body) {
+  const voterTelegramId = String(body?.voterTelegramId || body?.voter_telegram_id || "").trim();
+  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
+  const voteType = String(body?.type || "").trim();
+  const voterUsername = String(body?.voterUsername || body?.voter_username || "").trim();
+  const targetUsername = String(body?.targetUsername || body?.target_username || "").trim();
+  const targetAvatar = String(body?.targetAvatar || body?.target_avatar || "").trim();
+
+  if (!voterTelegramId || !targetTelegramId) throw new Error("voterTelegramId and targetTelegramId are required");
+  if (!["like", "dislike"].includes(voteType)) throw new Error("type must be 'like' or 'dislike'");
+  if (voterTelegramId === targetTelegramId) throw new Error("Self voting is not allowed");
+
+  const voterUser = upsertUser({ telegram_id: voterTelegramId, username: voterUsername || `user_${voterTelegramId}` });
+  const targetUser = upsertUser({
+    telegram_id: targetTelegramId,
+    username: targetUsername || `user_${targetTelegramId}`,
+    avatar: targetAvatar
+  });
+
+  const antiSpam = await checkAndHandleSpam(voterUser);
+  if (antiSpam.blocked) {
+    persistData();
+    return {
+      ok: false,
+      blocked: true,
+      message: "Voting blocked due to suspicious mass activity."
+    };
+  }
+
+  const key = `${voterTelegramId}:${targetTelegramId}`;
+  const existing = memory.votesByPair[key];
+
+  if (!existing) {
+    memory.votesByPair[key] = {
+      voterTelegramId,
+      targetTelegramId,
+      value: voteType,
+      changedOnce: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    applyUserCounters(targetUser, voteType, +1);
+    persistData();
+    return { ok: true, changed: false, warning: antiSpam.warning, user: targetUser };
+  }
+
+  if (existing.value === voteType) {
+    return { ok: false, unchanged: true, warning: antiSpam.warning, message: "Vote already set" };
+  }
+
+  if (existing.changedOnce) {
+    return { ok: false, locked: true, warning: antiSpam.warning, message: "Vote already changed once" };
+  }
+
+  applyUserCounters(targetUser, existing.value, -1);
+  applyUserCounters(targetUser, voteType, +1);
+  existing.value = voteType;
+  existing.changedOnce = true;
+  existing.updatedAt = Date.now();
+  persistData();
+  return { ok: true, changed: true, warning: antiSpam.warning, user: targetUser };
+}
+
+function applyUserCounters(user, voteType, delta) {
+  if (voteType === "like") user.likes = Math.max(0, Number(user.likes || 0) + delta);
+  if (voteType === "dislike") user.dislikes = Math.max(0, Number(user.dislikes || 0) + delta);
+  user.score = Number(user.likes || 0) - Number(user.dislikes || 0);
+}
+
+async function checkAndHandleSpam(voterUser) {
+  const voterId = String(voterUser.telegram_id);
+  const activity = ensureVoterActivity(voterId);
+  const now = Date.now();
+  activity.timestamps = activity.timestamps.filter((ts) => now - ts <= SPAM_WINDOW_MS);
+  activity.timestamps.push(now);
+
+  let warning = false;
+  if (activity.timestamps.length > SPAM_LIMIT) {
+    if (!activity.warned) {
+      activity.warned = true;
+      warning = true;
+    } else {
+      activity.blocked = true;
+      await banUserFromGroup(voterId);
+    }
+  }
+  return { warning, blocked: activity.blocked };
+}
+
+function toInitials(username) {
+  const source = String(username || "U").replace("@", "").trim();
+  if (!source) return "U";
+  return source.slice(0, 2).toUpperCase();
+}
+
+async function syncFromTelegramBotApi() {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    throw new Error("Set BOT_TOKEN and CHAT_ID for Telegram sync");
+  }
+
+  const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
+  const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+  let upserted = 0;
+
+  for (const member of admins) {
+    const user = member?.user;
+    if (!user?.id) continue;
+    if (
+      upsertUser({
+        telegram_id: String(user.id),
+        username: user.username || `${user.first_name || "user"}_${user.id}`,
+        avatar: ""
+      })
+    ) {
+      upserted += 1;
+    }
+  }
+
+  persistData();
+  return {
+    ok: true,
+    upserted,
+    note: "Telegram Bot API does not provide a full chat member list directly. Admin list synced; other users are added automatically on voting."
+  };
+}
+
+function scheduleAutoSyncFromTelegram() {
+  if (!BOT_TOKEN || !CHAT_ID) return;
+  setTimeout(() => {
+    syncFromTelegramBotApi().catch((error) => console.error("Initial Telegram sync failed:", error.message));
+  }, 1200);
+
+  setInterval(() => {
+    syncFromTelegramBotApi().catch((error) => console.error("Periodic Telegram sync failed:", error.message));
+  }, 5 * 60_000);
+}
+
+async function banUserFromGroup(userId) {
+  if (!BOT_TOKEN || !CHAT_ID) return;
+  try {
+    await telegramApi("banChatMember", { chat_id: CHAT_ID, user_id: Number(userId), revoke_messages: false });
+  } catch (error) {
+    console.error("Failed to ban user:", userId, error.message);
+  }
+}
+
+function telegramApi(method, payload) {
+  const body = JSON.stringify(payload);
+  const options = {
+    hostname: "api.telegram.org",
+    port: 443,
+    path: `/bot${BOT_TOKEN}/${method}`,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body)
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    const request = require("https").request(options, (response) => {
+      let raw = "";
+      response.on("data", (chunk) => {
+        raw += chunk;
+      });
+      response.on("end", () => {
         try {
-            const adminsResponse = await axios.get(
-                `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/getChatAdministrators`,
-                { params: { chat_id: CONFIG.GROUP_CHAT_ID } }
-            );
-            adminIds = adminsResponse.data.result.map(admin => String(admin.user.id));
+          const parsed = JSON.parse(raw);
+          if (!parsed.ok) {
+            return reject(new Error(parsed.description || `Telegram API error: ${method}`));
+          }
+          resolve(parsed);
         } catch (error) {
-            console.log('Не удалось получить список администраторов');
+          reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 220)}`));
         }
-
-        // Примечание: Telegram Bot API не позволяет получить полный список участников группы
-        // напрямую. Участники собираются через:
-        // 1. Webhook обновления (новые участники)
-        // 2. Взаимодействия с ботом
-        // 3. Ручное добавление через API /api/users/update
-        
-        // Возвращаем пустой массив, так как участники будут собираться через webhook
-        // или добавляться вручную
-        return [];
-    } catch (error) {
-        console.error('Ошибка получения участников группы:', error.response?.data || error.message);
-        return [];
-    }
-}
-
-// Обновление списка участников
-async function updateUsers() {
-    const members = await fetchGroupMembers();
-    
-    // Обновляем существующих пользователей и добавляем новых
-    const existingUserIds = new Set(data.users.map(u => String(u.id || u.chat_id)));
-    
-    members.forEach(member => {
-        const userId = String(member.id || member.user?.id);
-        if (!existingUserIds.has(userId)) {
-            data.users.push({
-                id: userId,
-                chat_id: userId,
-                first_name: member.first_name || member.user?.first_name || 'Неизвестно',
-                last_name: member.last_name || member.user?.last_name || '',
-                username: member.username || member.user?.username || null,
-                photo_100: member.photo_url || member.user?.photo_url || null
-            });
-        }
+      });
     });
-
-    await saveData();
-    return data.users;
+    request.on("error", reject);
+    request.write(body);
+    request.end();
+  });
 }
-
-// API Routes
-
-// Health check
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime()
-    });
-});
-
-// Получение всех участников
-app.get('/api/users', async (req, res) => {
-    try {
-        // Возвращаем сохраненных пользователей (они собираются через webhook)
-        // Фильтруем админов
-        const filteredUsers = data.users.filter(user => {
-            const userId = String(user.id || user.chat_id);
-            return !CONFIG.ADMIN_CHAT_IDS.includes(userId);
-        });
-
-        console.log(`Возвращаем ${filteredUsers.length} пользователей`);
-        res.json(filteredUsers);
-    } catch (error) {
-        console.error('Ошибка получения пользователей:', error);
-        res.status(500).json({ error: 'Ошибка получения пользователей' });
-    }
-});
-
-// Получение отзывов
-app.get('/api/reviews', (req, res) => {
-    try {
-        res.json(data.reviews);
-    } catch (error) {
-        console.error('Ошибка получения отзывов:', error);
-        res.status(500).json({ error: 'Ошибка получения отзывов' });
-    }
-});
-
-// Сохранение отзыва
-app.post('/api/reviews', async (req, res) => {
-    try {
-        const { userId, review } = req.body;
-
-        if (!userId || !review) {
-            return res.status(400).json({ error: 'Неверные данные' });
-        }
-
-        if (!data.reviews[userId]) {
-            data.reviews[userId] = {};
-        }
-
-        data.reviews[userId][review.authorId] = review;
-        await saveData();
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Ошибка сохранения отзыва:', error);
-        res.status(500).json({ error: 'Ошибка сохранения отзыва' });
-    }
-});
-
-// Удаление отзыва
-app.delete('/api/reviews/:userId/:authorId', async (req, res) => {
-    try {
-        const { userId, authorId } = req.params;
-
-        if (data.reviews[userId] && data.reviews[userId][authorId]) {
-            delete data.reviews[userId][authorId];
-            
-            if (Object.keys(data.reviews[userId]).length === 0) {
-                delete data.reviews[userId];
-            }
-
-            await saveData();
-            res.json({ success: true });
-        } else {
-            res.status(404).json({ error: 'Отзыв не найден' });
-        }
-    } catch (error) {
-        console.error('Ошибка удаления отзыва:', error);
-        res.status(500).json({ error: 'Ошибка удаления отзыва' });
-    }
-});
-
-// Обновление списка участников вручную
-app.post('/api/users/update', async (req, res) => {
-    try {
-        const users = await updateUsers();
-        res.json({ success: true, count: users.length });
-    } catch (error) {
-        console.error('Ошибка обновления пользователей:', error);
-        res.status(500).json({ error: 'Ошибка обновления пользователей' });
-    }
-});
-
-// Webhook для получения обновлений от Telegram
-app.post('/webhook', async (req, res) => {
-    try {
-        const update = req.body;
-        let usersUpdated = false;
-
-        // Обработка новых участников группы
-        if (update.message?.new_chat_members) {
-            for (const member of update.message.new_chat_members) {
-                const userId = String(member.id);
-                if (!CONFIG.ADMIN_CHAT_IDS.includes(userId)) {
-                    const existingUser = data.users.find(u => String(u.id || u.chat_id) === userId);
-                    if (!existingUser) {
-                        data.users.push({
-                            id: userId,
-                            chat_id: userId,
-                            first_name: member.first_name || 'Неизвестно',
-                            last_name: member.last_name || '',
-                            username: member.username || null,
-                            photo_100: null
-                        });
-                        usersUpdated = true;
-                        console.log(`Добавлен новый участник: ${member.first_name} ${member.last_name || ''} (${userId})`);
-                    }
-                }
-            }
-        }
-
-        // Обработка сообщений для сбора участников
-        if (update.message?.from && update.message?.chat?.id === CONFIG.GROUP_CHAT_ID) {
-            const member = update.message.from;
-            const userId = String(member.id);
-            if (!CONFIG.ADMIN_CHAT_IDS.includes(userId)) {
-                const existingUser = data.users.find(u => String(u.id || u.chat_id) === userId);
-                if (!existingUser) {
-                    data.users.push({
-                        id: userId,
-                        chat_id: userId,
-                        first_name: member.first_name || 'Неизвестно',
-                        last_name: member.last_name || '',
-                        username: member.username || null,
-                        photo_100: null
-                    });
-                    usersUpdated = true;
-                    console.log(`Добавлен участник из сообщения: ${member.first_name} ${member.last_name || ''} (${userId})`);
-                } else {
-                    // Обновляем информацию о существующем пользователе
-                    const updated = 
-                        existingUser.first_name !== member.first_name ||
-                        existingUser.last_name !== (member.last_name || '') ||
-                        existingUser.username !== (member.username || null);
-                    
-                    if (updated) {
-                        existingUser.first_name = member.first_name || existingUser.first_name;
-                        existingUser.last_name = member.last_name || existingUser.last_name;
-                        existingUser.username = member.username || existingUser.username;
-                        usersUpdated = true;
-                    }
-                }
-            }
-        }
-
-        if (usersUpdated) {
-            await saveData();
-            console.log(`Всего участников в базе: ${data.users.length}`);
-        }
-
-        res.json({ ok: true });
-    } catch (error) {
-        console.error('Ошибка обработки webhook:', error);
-        res.status(500).json({ error: 'Ошибка обработки webhook' });
-    }
-});
-
-// Ручное добавление пользователя (для тестирования или миграции)
-app.post('/api/users/add', async (req, res) => {
-    try {
-        const { user } = req.body;
-        
-        if (!user || !user.id) {
-            return res.status(400).json({ error: 'Неверные данные пользователя' });
-        }
-
-        const userId = String(user.id || user.chat_id);
-        if (CONFIG.ADMIN_CHAT_IDS.includes(userId)) {
-            return res.status(400).json({ error: 'Администраторы не могут быть добавлены' });
-        }
-
-        const existingUser = data.users.find(u => String(u.id || u.chat_id) === userId);
-        if (existingUser) {
-            // Обновляем существующего пользователя
-            Object.assign(existingUser, {
-                first_name: user.first_name || existingUser.first_name,
-                last_name: user.last_name || existingUser.last_name,
-                username: user.username || existingUser.username,
-                photo_100: user.photo_100 || user.photo_url || existingUser.photo_100
-            });
-        } else {
-            // Добавляем нового пользователя
-            data.users.push({
-                id: userId,
-                chat_id: userId,
-                first_name: user.first_name || 'Неизвестно',
-                last_name: user.last_name || '',
-                username: user.username || null,
-                photo_100: user.photo_100 || user.photo_url || null
-            });
-        }
-
-        await saveData();
-        res.json({ success: true, user: existingUser || data.users[data.users.length - 1] });
-    } catch (error) {
-        console.error('Ошибка добавления пользователя:', error);
-        res.status(500).json({ error: 'Ошибка добавления пользователя' });
-    }
-});
-
-// Запуск сервера
-async function startServer() {
-    await loadData();
-    
-    app.listen(PORT, () => {
-        console.log(`Сервер запущен на порту ${PORT}`);
-        console.log(`API доступен по адресу: http://localhost:${PORT}/api`);
-        console.log(`Группа ID: ${CONFIG.GROUP_CHAT_ID}`);
-        
-        if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-            console.warn('⚠️  ВНИМАНИЕ: Токен бота не указан!');
-            console.warn('Установите переменную окружения TELEGRAM_BOT_TOKEN');
-        }
-    });
-}
-
-startServer();
-
-module.exports = app;
-
