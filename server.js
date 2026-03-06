@@ -1,18 +1,26 @@
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE";
-const CHAT_ID = process.env.CHAT_ID || "-5293585696";
+const CHAT_ID = String(process.env.CHAT_ID || "-5293585696");
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
 const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 10);
+const COMMENTS_MAX_LEN = 280;
+
+const runtime = {
+  botUserId: "",
+  syncBusy: false,
+  pollBusy: false
+};
 
 const memory = loadData();
-scheduleAutoSyncFromTelegram();
+scheduleBootstrap();
 
 const server = http.createServer(async (req, res) => {
   setCorsHeaders(res);
@@ -27,7 +35,20 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (pathname === "/health" && req.method === "GET") {
-      return sendJson(res, 200, { ok: true, uptimeSec: Math.floor(process.uptime()) });
+      return sendJson(res, 200, {
+        ok: true,
+        uptimeSec: Math.floor(process.uptime()),
+        users: getSortedUsers().length
+      });
+    }
+
+    if (pathname === "/api/config" && req.method === "GET") {
+      return sendJson(res, 200, {
+        spamLimit: SPAM_LIMIT,
+        spamWindowMs: SPAM_WINDOW_MS,
+        hasBot: Boolean(BOT_TOKEN && CHAT_ID),
+        botUserId: runtime.botUserId || null
+      });
     }
 
     if (pathname === "/api/users" && req.method === "GET") {
@@ -42,17 +63,27 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (pathname === "/api/config" && req.method === "GET") {
+    if (pathname === "/api/user-profile" && req.method === "GET") {
+      const targetTelegramId = String(parsed.searchParams.get("telegramId") || "").trim();
+      const viewerTelegramId = String(parsed.searchParams.get("viewerTelegramId") || "").trim();
+      if (!targetTelegramId) throw new Error("telegramId is required");
+      const profile = getUserProfile(targetTelegramId, viewerTelegramId);
+      if (!profile.user) return sendJson(res, 404, { ok: false, error: "User not found" });
+      return sendJson(res, 200, { ok: true, ...profile });
+    }
+
+    if (pathname === "/api/comments" && req.method === "GET") {
+      const targetTelegramId = String(parsed.searchParams.get("targetTelegramId") || "").trim();
+      if (!targetTelegramId) throw new Error("targetTelegramId is required");
       return sendJson(res, 200, {
-        spamLimit: SPAM_LIMIT,
-        spamWindowMs: SPAM_WINDOW_MS,
-        hasBot: Boolean(BOT_TOKEN && CHAT_ID)
+        ok: true,
+        comments: getCommentsByTarget(targetTelegramId)
       });
     }
 
     if (pathname === "/api/users/sync" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const count = syncUsersFromPayload(body);
+      const count = await syncUsersFromPayload(body);
       persistData();
       return sendJson(res, 200, { ok: true, upserted: count, users: getSortedUsers() });
     }
@@ -62,9 +93,21 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === "/api/telegram/webhook" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = await ingestTelegramUpdates(body);
+      return sendJson(res, 200, result);
+    }
+
     if (pathname === "/api/vote" && req.method === "POST") {
       const body = await readJsonBody(req);
       const result = await applyVote(body);
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/comment" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = await addComment(body);
       return sendJson(res, 200, result);
     }
 
@@ -94,15 +137,13 @@ function readJsonBody(req) {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 1_000_000) {
-        reject(new Error("Payload too large"));
-      }
+      if (data.length > 1_000_000) reject(new Error("Payload too large"));
     });
     req.on("end", () => {
       if (!data) return resolve({});
       try {
         resolve(JSON.parse(data));
-      } catch (error) {
+      } catch (_error) {
         reject(new Error("Invalid JSON body"));
       }
     });
@@ -116,18 +157,33 @@ function loadData() {
       return {
         usersByTelegramId: {},
         votesByPair: {},
-        voterActivity: {}
+        voterActivity: {},
+        commentsByTarget: {},
+        commentLocksByPair: {},
+        telegram: { updatesOffset: 0 }
       };
     }
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     return {
       usersByTelegramId: parsed.usersByTelegramId || {},
       votesByPair: parsed.votesByPair || {},
-      voterActivity: parsed.voterActivity || {}
+      voterActivity: parsed.voterActivity || {},
+      commentsByTarget: parsed.commentsByTarget || {},
+      commentLocksByPair: parsed.commentLocksByPair || {},
+      telegram: {
+        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0)
+      }
     };
   } catch (error) {
-    console.error("Failed to read data file, starting with empty state", error);
-    return { usersByTelegramId: {}, votesByPair: {}, voterActivity: {} };
+    console.error("Failed to read data file, starting from empty state:", error.message);
+    return {
+      usersByTelegramId: {},
+      votesByPair: {},
+      voterActivity: {},
+      commentsByTarget: {},
+      commentLocksByPair: {},
+      telegram: { updatesOffset: 0 }
+    };
   }
 }
 
@@ -136,47 +192,110 @@ function persistData() {
   clearTimeout(writeTimer);
   writeTimer = setTimeout(() => {
     fs.writeFile(DATA_FILE, JSON.stringify(memory, null, 2), "utf8", (error) => {
-      if (error) console.error("Failed to persist data:", error);
+      if (error) console.error("Failed to persist data:", error.message);
     });
-  }, 100);
+  }, 120);
 }
 
-function upsertUser(input) {
-  const telegramId = String(input.telegram_id ?? input.telegramId ?? "").trim();
+function scheduleBootstrap() {
+  if (!BOT_TOKEN || !CHAT_ID) return;
+  setTimeout(() => {
+    bootstrapBotState().catch((error) => console.error("Bootstrap failed:", error.message));
+  }, 1000);
+}
+
+async function bootstrapBotState() {
+  await resolveBotUserId();
+  await syncFromTelegramBotApi();
+  await pollUpdatesAndSyncUsers();
+
+  setInterval(() => {
+    syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
+  }, 5 * 60_000);
+
+  setInterval(() => {
+    pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
+  }, 12_000);
+}
+
+async function resolveBotUserId() {
+  if (!BOT_TOKEN) return "";
+  if (runtime.botUserId) return runtime.botUserId;
+  try {
+    const me = await telegramApi("getMe", {});
+    runtime.botUserId = String(me?.result?.id || "");
+  } catch (error) {
+    console.error("Failed to resolve bot id:", error.message);
+  }
+  return runtime.botUserId;
+}
+
+function isBotUserId(telegramId) {
+  return runtime.botUserId && String(runtime.botUserId) === String(telegramId);
+}
+
+function normalizeUsername(input, fallbackTelegramId) {
+  const raw = String(input || "").replace(/^@/, "").trim();
+  if (raw) return raw;
+  return `user_${fallbackTelegramId}`;
+}
+
+function normalizeTelegramName(input, username) {
+  const raw = String(input || "").trim();
+  if (raw) return raw;
+  return username;
+}
+
+async function upsertUser(input, options = {}) {
+  const telegramId = String(input?.telegram_id ?? input?.telegramId ?? "").trim();
   if (!telegramId) return null;
+  if (isBotUserId(telegramId)) return null;
 
   const current = memory.usersByTelegramId[telegramId] || {
     id: `usr_${telegramId}`,
     telegram_id: telegramId,
     username: `user_${telegramId}`,
+    telegram_name: `user_${telegramId}`,
     avatar: "",
     likes: 0,
     dislikes: 0,
     score: 0
   };
 
-  const username = String(input.username || current.username || `user_${telegramId}`).replace(/^@/, "");
-  const avatar = typeof input.avatar === "string" ? input.avatar : current.avatar;
+  const username = normalizeUsername(input.username || current.username, telegramId);
+  const telegramName = normalizeTelegramName(input.telegram_name || input.telegramName || current.telegram_name, username);
+  const avatarIncoming = typeof input.avatar === "string" ? input.avatar.trim() : current.avatar;
 
-  memory.usersByTelegramId[telegramId] = {
+  const updated = {
     ...current,
     username,
-    avatar
+    telegram_name: telegramName,
+    avatar: avatarIncoming
   };
+  memory.usersByTelegramId[telegramId] = updated;
+
+  const needsAvatar = options.fetchAvatar !== false && !updated.avatar;
+  if (needsAvatar && BOT_TOKEN) {
+    const avatar = await getUserAvatarFromTelegram(telegramId);
+    if (avatar) {
+      updated.avatar = avatar;
+      memory.usersByTelegramId[telegramId] = updated;
+    }
+  }
   return memory.usersByTelegramId[telegramId];
 }
 
-function syncUsersFromPayload(body) {
+async function syncUsersFromPayload(body) {
   const items = Array.isArray(body?.users) ? body.users : [];
   let upserted = 0;
   for (const item of items) {
-    if (upsertUser(item)) upserted += 1;
+    if (await upsertUser(item, { fetchAvatar: true })) upserted += 1;
   }
   return upserted;
 }
 
 function getSortedUsers() {
-  const users = Object.values(memory.usersByTelegramId);
+  const users = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
   return users.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     if (b.likes !== a.likes) return b.likes - a.likes;
@@ -189,69 +308,6 @@ function ensureVoterActivity(voterTelegramId) {
     memory.voterActivity[voterTelegramId] = { timestamps: [], warned: false, blocked: false };
   }
   return memory.voterActivity[voterTelegramId];
-}
-
-async function applyVote(body) {
-  const voterTelegramId = String(body?.voterTelegramId || body?.voter_telegram_id || "").trim();
-  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
-  const voteType = String(body?.type || "").trim();
-  const voterUsername = String(body?.voterUsername || body?.voter_username || "").trim();
-  const targetUsername = String(body?.targetUsername || body?.target_username || "").trim();
-  const targetAvatar = String(body?.targetAvatar || body?.target_avatar || "").trim();
-
-  if (!voterTelegramId || !targetTelegramId) throw new Error("voterTelegramId and targetTelegramId are required");
-  if (!["like", "dislike"].includes(voteType)) throw new Error("type must be 'like' or 'dislike'");
-  if (voterTelegramId === targetTelegramId) throw new Error("Self voting is not allowed");
-
-  const voterUser = upsertUser({ telegram_id: voterTelegramId, username: voterUsername || `user_${voterTelegramId}` });
-  const targetUser = upsertUser({
-    telegram_id: targetTelegramId,
-    username: targetUsername || `user_${targetTelegramId}`,
-    avatar: targetAvatar
-  });
-
-  const antiSpam = await checkAndHandleSpam(voterUser);
-  if (antiSpam.blocked) {
-    persistData();
-    return {
-      ok: false,
-      blocked: true,
-      message: "Voting blocked due to suspicious mass activity."
-    };
-  }
-
-  const key = `${voterTelegramId}:${targetTelegramId}`;
-  const existing = memory.votesByPair[key];
-
-  if (!existing) {
-    memory.votesByPair[key] = {
-      voterTelegramId,
-      targetTelegramId,
-      value: voteType,
-      changedOnce: false,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    applyUserCounters(targetUser, voteType, +1);
-    persistData();
-    return { ok: true, changed: false, warning: antiSpam.warning, user: targetUser };
-  }
-
-  if (existing.value === voteType) {
-    return { ok: false, unchanged: true, warning: antiSpam.warning, message: "Vote already set" };
-  }
-
-  if (existing.changedOnce) {
-    return { ok: false, locked: true, warning: antiSpam.warning, message: "Vote already changed once" };
-  }
-
-  applyUserCounters(targetUser, existing.value, -1);
-  applyUserCounters(targetUser, voteType, +1);
-  existing.value = voteType;
-  existing.changedOnce = true;
-  existing.updatedAt = Date.now();
-  persistData();
-  return { ok: true, changed: true, warning: antiSpam.warning, user: targetUser };
 }
 
 function applyUserCounters(user, voteType, delta) {
@@ -280,56 +336,301 @@ async function checkAndHandleSpam(voterUser) {
   return { warning, blocked: activity.blocked };
 }
 
-function toInitials(username) {
-  const source = String(username || "U").replace("@", "").trim();
-  if (!source) return "U";
-  return source.slice(0, 2).toUpperCase();
+async function applyVote(body) {
+  const voterTelegramId = String(body?.voterTelegramId || body?.voter_telegram_id || "").trim();
+  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
+  const voteType = String(body?.type || "").trim();
+  const voterUsername = String(body?.voterUsername || body?.voter_username || "").trim();
+  const targetUsername = String(body?.targetUsername || body?.target_username || "").trim();
+  const voterAvatar = String(body?.voterAvatar || body?.voter_avatar || "").trim();
+  const targetAvatar = String(body?.targetAvatar || body?.target_avatar || "").trim();
+  const voterTelegramName = String(body?.voterTelegramName || body?.voter_telegram_name || "").trim();
+  const targetTelegramName = String(body?.targetTelegramName || body?.target_telegram_name || "").trim();
+
+  if (!voterTelegramId || !targetTelegramId) throw new Error("voterTelegramId and targetTelegramId are required");
+  if (!["like", "dislike"].includes(voteType)) throw new Error("type must be 'like' or 'dislike'");
+  if (voterTelegramId === targetTelegramId) throw new Error("Self voting is not allowed");
+  if (isBotUserId(voterTelegramId) || isBotUserId(targetTelegramId)) {
+    throw new Error("Bot account cannot vote or receive votes");
+  }
+
+  const voterUser = await upsertUser({
+    telegram_id: voterTelegramId,
+    username: voterUsername,
+    telegram_name: voterTelegramName,
+    avatar: voterAvatar
+  });
+  const targetUser = await upsertUser({
+    telegram_id: targetTelegramId,
+    username: targetUsername,
+    telegram_name: targetTelegramName,
+    avatar: targetAvatar
+  });
+
+  if (!voterUser || !targetUser) throw new Error("Invalid voter or target user");
+
+  const antiSpam = await checkAndHandleSpam(voterUser);
+  if (antiSpam.blocked) {
+    persistData();
+    return { ok: false, blocked: true, message: "Voting blocked due to suspicious mass activity." };
+  }
+
+  const key = `${voterTelegramId}:${targetTelegramId}`;
+  const existing = memory.votesByPair[key];
+
+  if (!existing) {
+    memory.votesByPair[key] = {
+      voterTelegramId,
+      targetTelegramId,
+      value: voteType,
+      changedOnce: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    applyUserCounters(targetUser, voteType, +1);
+    persistData();
+    return { ok: true, changed: false, warning: antiSpam.warning, user: targetUser };
+  }
+
+  if (existing.value === voteType) {
+    return { ok: false, unchanged: true, warning: antiSpam.warning, message: "Vote already set" };
+  }
+  if (existing.changedOnce) {
+    return { ok: false, locked: true, warning: antiSpam.warning, message: "Vote already changed once" };
+  }
+
+  applyUserCounters(targetUser, existing.value, -1);
+  applyUserCounters(targetUser, voteType, +1);
+  existing.value = voteType;
+  existing.changedOnce = true;
+  existing.updatedAt = Date.now();
+  persistData();
+  return { ok: true, changed: true, warning: antiSpam.warning, user: targetUser };
+}
+
+function getCommentsByTarget(targetTelegramId) {
+  const items = Array.isArray(memory.commentsByTarget[targetTelegramId]) ? memory.commentsByTarget[targetTelegramId] : [];
+  return [...items].sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function getUserProfile(targetTelegramId, viewerTelegramId) {
+  const user = memory.usersByTelegramId[targetTelegramId] || null;
+  const comments = getCommentsByTarget(targetTelegramId);
+  const commentKey = `${viewerTelegramId}:${targetTelegramId}`;
+  const canComment = Boolean(viewerTelegramId && viewerTelegramId !== targetTelegramId && !memory.commentLocksByPair[commentKey]);
+  return { user, comments, canComment };
+}
+
+async function addComment(body) {
+  const authorTelegramId = String(body?.authorTelegramId || body?.author_telegram_id || "").trim();
+  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
+  const text = String(body?.text || "").trim();
+
+  const authorUsername = String(body?.authorUsername || body?.author_username || "").trim();
+  const authorTelegramName = String(body?.authorTelegramName || body?.author_telegram_name || "").trim();
+  const authorAvatar = String(body?.authorAvatar || body?.author_avatar || "").trim();
+  const targetUsername = String(body?.targetUsername || body?.target_username || "").trim();
+  const targetTelegramName = String(body?.targetTelegramName || body?.target_telegram_name || "").trim();
+  const targetAvatar = String(body?.targetAvatar || body?.target_avatar || "").trim();
+
+  if (!authorTelegramId || !targetTelegramId) throw new Error("authorTelegramId and targetTelegramId are required");
+  if (authorTelegramId === targetTelegramId) throw new Error("Self comment is not allowed");
+  if (isBotUserId(authorTelegramId) || isBotUserId(targetTelegramId)) throw new Error("Bot account is excluded");
+  if (!text) throw new Error("Comment text is required");
+  if (text.length > COMMENTS_MAX_LEN) throw new Error(`Comment is too long (max ${COMMENTS_MAX_LEN})`);
+
+  await upsertUser({
+    telegram_id: authorTelegramId,
+    username: authorUsername,
+    telegram_name: authorTelegramName,
+    avatar: authorAvatar
+  });
+  await upsertUser({
+    telegram_id: targetTelegramId,
+    username: targetUsername,
+    telegram_name: targetTelegramName,
+    avatar: targetAvatar
+  });
+
+  const lockKey = `${authorTelegramId}:${targetTelegramId}`;
+  if (memory.commentLocksByPair[lockKey]) {
+    return { ok: false, locked: true, message: "Comment already exists and cannot be changed" };
+  }
+
+  const author = memory.usersByTelegramId[authorTelegramId];
+  const comment = {
+    id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    targetTelegramId,
+    authorTelegramId,
+    authorUsername: author.username,
+    authorTelegramName: author.telegram_name || author.username,
+    authorAvatar: author.avatar || "",
+    text,
+    createdAt: Date.now()
+  };
+
+  if (!Array.isArray(memory.commentsByTarget[targetTelegramId])) memory.commentsByTarget[targetTelegramId] = [];
+  memory.commentsByTarget[targetTelegramId].push(comment);
+  memory.commentLocksByPair[lockKey] = true;
+  persistData();
+  return {
+    ok: true,
+    comment,
+    comments: getCommentsByTarget(targetTelegramId)
+  };
 }
 
 async function syncFromTelegramBotApi() {
   if (!BOT_TOKEN || !CHAT_ID) {
-    throw new Error("Set BOT_TOKEN and CHAT_ID for Telegram sync");
+    return { ok: false, error: "Set BOT_TOKEN and CHAT_ID for Telegram sync" };
   }
+  if (runtime.syncBusy) {
+    return { ok: true, skipped: true, reason: "sync already in progress" };
+  }
+  runtime.syncBusy = true;
+  try {
+    await resolveBotUserId();
+    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
+    const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+    let upserted = 0;
 
-  const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
-  const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
-  let upserted = 0;
-
-  for (const member of admins) {
-    const user = member?.user;
-    if (!user?.id) continue;
-    if (
-      upsertUser({
-        telegram_id: String(user.id),
-        username: user.username || `${user.first_name || "user"}_${user.id}`,
+    for (const member of admins) {
+      const tgUser = member?.user;
+      if (!tgUser?.id) continue;
+      if (String(tgUser.id) === String(runtime.botUserId)) continue;
+      const user = await upsertUser({
+        telegram_id: String(tgUser.id),
+        username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
+        telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
         avatar: ""
-      })
-    ) {
-      upserted += 1;
+      });
+      if (user) upserted += 1;
     }
-  }
 
-  persistData();
-  return {
-    ok: true,
-    upserted,
-    note: "Telegram Bot API does not provide a full chat member list directly. Admin list synced; other users are added automatically on voting."
-  };
+    const pollResult = await pollUpdatesAndSyncUsers();
+    persistData();
+    return {
+      ok: true,
+      upserted,
+      updatesUsers: pollResult.upserted,
+      note: "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
+    };
+  } finally {
+    runtime.syncBusy = false;
+  }
 }
 
-function scheduleAutoSyncFromTelegram() {
-  if (!BOT_TOKEN || !CHAT_ID) return;
-  setTimeout(() => {
-    syncFromTelegramBotApi().catch((error) => console.error("Initial Telegram sync failed:", error.message));
-  }, 1200);
+async function ingestTelegramUpdates(payload) {
+  await resolveBotUserId();
+  const updates = Array.isArray(payload) ? payload : (payload?.update_id ? [payload] : payload?.updates || []);
+  if (!Array.isArray(updates) || !updates.length) return { ok: true, upserted: 0, skipped: true };
 
-  setInterval(() => {
-    syncFromTelegramBotApi().catch((error) => console.error("Periodic Telegram sync failed:", error.message));
-  }, 5 * 60_000);
+  const extracted = [];
+  for (const update of updates) extracted.push(...extractUsersFromUpdate(update));
+
+  let upserted = 0;
+  const seen = new Set();
+  for (const entry of extracted) {
+    const id = String(entry.telegram_id || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const user = await upsertUser(entry, { fetchAvatar: true });
+    if (user) upserted += 1;
+  }
+  persistData();
+  return { ok: true, upserted };
+}
+
+async function pollUpdatesAndSyncUsers() {
+  if (!BOT_TOKEN || !CHAT_ID) return { ok: false, upserted: 0 };
+  if (runtime.pollBusy) return { ok: true, upserted: 0, skipped: true };
+  runtime.pollBusy = true;
+  try {
+    const offset = Number(memory?.telegram?.updatesOffset || 0);
+    const data = await telegramApi("getUpdates", { timeout: 0, offset, allowed_updates: ["message", "chat_member", "my_chat_member"] });
+    const updates = Array.isArray(data?.result) ? data.result : [];
+    if (!updates.length) return { ok: true, upserted: 0 };
+
+    const extracted = [];
+    let maxUpdateId = offset;
+    for (const update of updates) {
+      if (typeof update?.update_id === "number" && update.update_id >= maxUpdateId) {
+        maxUpdateId = update.update_id + 1;
+      }
+      extracted.push(...extractUsersFromUpdate(update));
+    }
+
+    let upserted = 0;
+    const seen = new Set();
+    for (const entry of extracted) {
+      const id = String(entry.telegram_id);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const user = await upsertUser(entry, { fetchAvatar: true });
+      if (user) upserted += 1;
+    }
+
+    memory.telegram.updatesOffset = maxUpdateId;
+    persistData();
+    return { ok: true, upserted };
+  } finally {
+    runtime.pollBusy = false;
+  }
+}
+
+function extractUsersFromUpdate(update) {
+  const users = [];
+
+  function pushFromTgUser(tgUser) {
+    if (!tgUser?.id) return;
+    const telegramId = String(tgUser.id);
+    if (isBotUserId(telegramId)) return;
+    users.push({
+      telegram_id: telegramId,
+      username: tgUser.username || `${tgUser.first_name || "user"}_${telegramId}`,
+      telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
+      avatar: ""
+    });
+  }
+
+  function chatMatches(chat) {
+    return String(chat?.id || "") === String(CHAT_ID);
+  }
+
+  if (update?.message && chatMatches(update.message.chat)) {
+    pushFromTgUser(update.message.from);
+    const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
+    for (const member of joins) pushFromTgUser(member);
+  }
+  if (update?.chat_member && chatMatches(update.chat_member.chat)) {
+    pushFromTgUser(update.chat_member.from);
+    pushFromTgUser(update.chat_member.new_chat_member?.user);
+    pushFromTgUser(update.chat_member.old_chat_member?.user);
+  }
+  if (update?.my_chat_member && chatMatches(update.my_chat_member.chat)) {
+    pushFromTgUser(update.my_chat_member.from);
+  }
+  return users;
+}
+
+async function getUserAvatarFromTelegram(telegramId) {
+  if (!BOT_TOKEN) return "";
+  try {
+    const photos = await telegramApi("getUserProfilePhotos", { user_id: Number(telegramId), limit: 1 });
+    const fileId = photos?.result?.photos?.[0]?.[0]?.file_id;
+    if (!fileId) return "";
+    const file = await telegramApi("getFile", { file_id: fileId });
+    const filePath = file?.result?.file_path;
+    if (!filePath) return "";
+    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  } catch (_error) {
+    return "";
+  }
 }
 
 async function banUserFromGroup(userId) {
   if (!BOT_TOKEN || !CHAT_ID) return;
+  if (isBotUserId(userId)) return;
   try {
     await telegramApi("banChatMember", { chat_id: CHAT_ID, user_id: Number(userId), revoke_messages: false });
   } catch (error) {
@@ -338,7 +639,7 @@ async function banUserFromGroup(userId) {
 }
 
 function telegramApi(method, payload) {
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(payload || {});
   const options = {
     hostname: "api.telegram.org",
     port: 443,
@@ -351,7 +652,7 @@ function telegramApi(method, payload) {
   };
 
   return new Promise((resolve, reject) => {
-    const request = require("https").request(options, (response) => {
+    const request = https.request(options, (response) => {
       let raw = "";
       response.on("data", (chunk) => {
         raw += chunk;
@@ -359,17 +660,17 @@ function telegramApi(method, payload) {
       response.on("end", () => {
         try {
           const parsed = JSON.parse(raw);
-          if (!parsed.ok) {
-            return reject(new Error(parsed.description || `Telegram API error: ${method}`));
-          }
+          if (!parsed.ok) return reject(new Error(parsed.description || `Telegram API error: ${method}`));
           resolve(parsed);
-        } catch (error) {
-          reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 220)}`));
+        } catch (_error) {
+          reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 240)}`));
         }
       });
     });
+
     request.on("error", reject);
     request.write(body);
     request.end();
   });
 }
+
