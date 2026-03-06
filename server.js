@@ -52,7 +52,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/users" && req.method === "GET") {
-      return sendJson(res, 200, { users: getSortedUsers() });
+      const viewerTelegramId = String(parsed.searchParams.get("viewerTelegramId") || "").trim();
+      return sendJson(res, 200, { users: getSortedUsers({ viewerTelegramId }) });
     }
 
     if (pathname === "/api/leaderboard" && req.method === "GET") {
@@ -159,7 +160,7 @@ function loadData() {
         votesByPair: {},
         voterActivity: {},
         commentsByTarget: {},
-        commentLocksByPair: {},
+        commentStateByPair: {},
         telegram: { updatesOffset: 0 }
       };
     }
@@ -169,7 +170,7 @@ function loadData() {
       votesByPair: parsed.votesByPair || {},
       voterActivity: parsed.voterActivity || {},
       commentsByTarget: parsed.commentsByTarget || {},
-      commentLocksByPair: parsed.commentLocksByPair || {},
+      commentStateByPair: parsed.commentStateByPair || migrateCommentState(parsed.commentLocksByPair || {}),
       telegram: {
         updatesOffset: Number(parsed?.telegram?.updatesOffset || 0)
       }
@@ -181,10 +182,19 @@ function loadData() {
       votesByPair: {},
       voterActivity: {},
       commentsByTarget: {},
-      commentLocksByPair: {},
+      commentStateByPair: {},
       telegram: { updatesOffset: 0 }
     };
   }
+}
+
+function migrateCommentState(oldLocks) {
+  const migrated = {};
+  for (const key of Object.keys(oldLocks || {})) {
+    if (!oldLocks[key]) continue;
+    migrated[key] = { commentId: "", changedOnce: true };
+  }
+  return migrated;
 }
 
 let writeTimer = null;
@@ -294,13 +304,31 @@ async function syncUsersFromPayload(body) {
   return upserted;
 }
 
-function getSortedUsers() {
+function getSortedUsers(options = {}) {
+  const viewerTelegramId = String(options.viewerTelegramId || "").trim();
   const users = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
-  return users.sort((a, b) => {
+
+  const rated = users.filter((user) => Number(user.likes || 0) + Number(user.dislikes || 0) > 0);
+  let visible = rated;
+
+  if (viewerTelegramId && memory.usersByTelegramId[viewerTelegramId] && !isBotUserId(viewerTelegramId)) {
+    const me = memory.usersByTelegramId[viewerTelegramId];
+    const hasMe = visible.some((user) => String(user.telegram_id) === viewerTelegramId);
+    visible = hasMe ? visible : [me, ...visible];
+  }
+
+  visible.sort((a, b) => {
+    if (viewerTelegramId) {
+      const aIsViewer = String(a.telegram_id) === viewerTelegramId;
+      const bIsViewer = String(b.telegram_id) === viewerTelegramId;
+      if (aIsViewer && !bIsViewer) return -1;
+      if (!aIsViewer && bIsViewer) return 1;
+    }
     if (b.score !== a.score) return b.score - a.score;
     if (b.likes !== a.likes) return b.likes - a.likes;
     return a.dislikes - b.dislikes;
   });
+  return visible;
 }
 
 function ensureVoterActivity(voterTelegramId) {
@@ -417,8 +445,14 @@ function getUserProfile(targetTelegramId, viewerTelegramId) {
   const user = memory.usersByTelegramId[targetTelegramId] || null;
   const comments = getCommentsByTarget(targetTelegramId);
   const commentKey = `${viewerTelegramId}:${targetTelegramId}`;
-  const canComment = Boolean(viewerTelegramId && viewerTelegramId !== targetTelegramId && !memory.commentLocksByPair[commentKey]);
-  return { user, comments, canComment };
+  const state = memory.commentStateByPair[commentKey] || null;
+  const ownComment = state?.commentId
+    ? comments.find((entry) => entry.id === state.commentId) || null
+    : comments.find((entry) => String(entry.authorTelegramId) === viewerTelegramId) || null;
+  const canEdit = Boolean(state && !state.changedOnce);
+  const canCreate = Boolean(viewerTelegramId && viewerTelegramId !== targetTelegramId && !state);
+  const canComment = canCreate || canEdit;
+  return { user, comments, canComment, canEdit, ownComment };
 }
 
 async function addComment(body) {
@@ -453,29 +487,55 @@ async function addComment(body) {
   });
 
   const lockKey = `${authorTelegramId}:${targetTelegramId}`;
-  if (memory.commentLocksByPair[lockKey]) {
-    return { ok: false, locked: true, message: "Comment already exists and cannot be changed" };
+  const state = memory.commentStateByPair[lockKey] || null;
+  const author = memory.usersByTelegramId[authorTelegramId];
+  if (!Array.isArray(memory.commentsByTarget[targetTelegramId])) memory.commentsByTarget[targetTelegramId] = [];
+  const bucket = memory.commentsByTarget[targetTelegramId];
+
+  if (!state) {
+    const comment = {
+      id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      targetTelegramId,
+      authorTelegramId,
+      authorUsername: author.username,
+      authorTelegramName: author.telegram_name || author.username,
+      authorAvatar: author.avatar || "",
+      text,
+      createdAt: Date.now(),
+      editedAt: null
+    };
+    bucket.push(comment);
+    memory.commentStateByPair[lockKey] = { commentId: comment.id, changedOnce: false };
+    persistData();
+    return {
+      ok: true,
+      edited: false,
+      comment,
+      comments: getCommentsByTarget(targetTelegramId)
+    };
   }
 
-  const author = memory.usersByTelegramId[authorTelegramId];
-  const comment = {
-    id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    targetTelegramId,
-    authorTelegramId,
-    authorUsername: author.username,
-    authorTelegramName: author.telegram_name || author.username,
-    authorAvatar: author.avatar || "",
-    text,
-    createdAt: Date.now()
-  };
+  if (state.changedOnce) {
+    return { ok: false, locked: true, message: "Comment already changed once" };
+  }
 
-  if (!Array.isArray(memory.commentsByTarget[targetTelegramId])) memory.commentsByTarget[targetTelegramId] = [];
-  memory.commentsByTarget[targetTelegramId].push(comment);
-  memory.commentLocksByPair[lockKey] = true;
+  const existing = bucket.find((entry) => entry.id === state.commentId) || bucket.find((entry) => String(entry.authorTelegramId) === authorTelegramId);
+  if (!existing) {
+    return { ok: false, locked: true, message: "Comment not found for update" };
+  }
+  existing.text = text;
+  existing.editedAt = Date.now();
+  existing.authorUsername = author.username;
+  existing.authorTelegramName = author.telegram_name || author.username;
+  existing.authorAvatar = author.avatar || "";
+  state.commentId = existing.id;
+  state.changedOnce = true;
+  memory.commentStateByPair[lockKey] = state;
   persistData();
   return {
     ok: true,
-    comment,
+    edited: true,
+    comment: existing,
     comments: getCommentsByTarget(targetTelegramId)
   };
 }
