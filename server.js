@@ -12,6 +12,15 @@ const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
 const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 10);
 const COMMENTS_MAX_LEN = 280;
+const TELEGRAM_MODE = String(process.env.TELEGRAM_MODE || "webhook").toLowerCase();
+const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "");
+const DEFAULT_WEBHOOK_BASE_URL = "https://nacur.onrender.com";
+const WEBHOOK_BASE_URL = String(
+  process.env.WEBHOOK_BASE_URL ||
+  DEFAULT_WEBHOOK_BASE_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  ""
+).trim();
 
 const runtime = {
   botUserId: "",
@@ -47,7 +56,8 @@ const server = http.createServer(async (req, res) => {
         spamLimit: SPAM_LIMIT,
         spamWindowMs: SPAM_WINDOW_MS,
         hasBot: Boolean(BOT_TOKEN && CHAT_ID),
-        botUserId: runtime.botUserId || null
+        botUserId: runtime.botUserId || null,
+        telegramMode: TELEGRAM_MODE
       });
     }
 
@@ -94,7 +104,23 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === "/api/telegram/webhook/set" && req.method === "POST") {
+      const result = await setTelegramWebhook();
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/telegram/webhook/info" && req.method === "GET") {
+      const result = await getTelegramWebhookInfo();
+      return sendJson(res, 200, result);
+    }
+
     if (pathname === "/api/telegram/webhook" && req.method === "POST") {
+      if (WEBHOOK_SECRET) {
+        const secretHeader = String(req.headers["x-telegram-bot-api-secret-token"] || "");
+        if (secretHeader !== WEBHOOK_SECRET) {
+          return sendJson(res, 401, { ok: false, error: "Invalid webhook secret" });
+        }
+      }
       const body = await readJsonBody(req);
       const result = await ingestTelegramUpdates(body);
       return sendJson(res, 200, result);
@@ -217,12 +243,18 @@ function scheduleBootstrap() {
 async function bootstrapBotState() {
   await resolveBotUserId();
   await syncFromTelegramBotApi();
-  await pollUpdatesAndSyncUsers();
+  if (TELEGRAM_MODE === "webhook") {
+    await setTelegramWebhook().catch((error) => console.error("Webhook setup failed:", error.message));
+    setInterval(() => {
+      syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
+    }, 5 * 60_000);
+    return;
+  }
 
+  await pollUpdatesAndSyncUsers();
   setInterval(() => {
     syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
   }, 5 * 60_000);
-
   setInterval(() => {
     pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
   }, 12_000);
@@ -567,13 +599,17 @@ async function syncFromTelegramBotApi() {
       if (user) upserted += 1;
     }
 
-    const pollResult = await pollUpdatesAndSyncUsers();
+    const pollResult = TELEGRAM_MODE === "polling"
+      ? await pollUpdatesAndSyncUsers()
+      : { ok: true, upserted: 0, skipped: true };
     persistData();
     return {
       ok: true,
       upserted,
       updatesUsers: pollResult.upserted,
-      note: "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
+      note: TELEGRAM_MODE === "polling"
+        ? "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
+        : "Users are auto-added from admin list and Telegram webhook updates. Bot account is excluded."
     };
   } finally {
     runtime.syncBusy = false;
@@ -636,6 +672,41 @@ async function pollUpdatesAndSyncUsers() {
   } finally {
     runtime.pollBusy = false;
   }
+}
+
+function getWebhookUrl() {
+  if (!WEBHOOK_BASE_URL) return "";
+  return `${WEBHOOK_BASE_URL.replace(/\/$/, "")}/api/telegram/webhook`;
+}
+
+async function setTelegramWebhook() {
+  if (!BOT_TOKEN) return { ok: false, error: "BOT_TOKEN is not set" };
+  const webhookUrl = getWebhookUrl();
+  if (!webhookUrl) {
+    return {
+      ok: false,
+      error: "WEBHOOK_BASE_URL (or RENDER_EXTERNAL_URL) is required for webhook setup"
+    };
+  }
+
+  const payload = { url: webhookUrl };
+  if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
+  await telegramApi("setWebhook", payload);
+  const info = await getTelegramWebhookInfo();
+  return { ok: true, webhookUrl, info };
+}
+
+async function getTelegramWebhookInfo() {
+  if (!BOT_TOKEN) return { ok: false, error: "BOT_TOKEN is not set" };
+  const info = await telegramApi("getWebhookInfo", {});
+  return {
+    ok: true,
+    url: info?.result?.url || "",
+    hasCustomCertificate: Boolean(info?.result?.has_custom_certificate),
+    pendingUpdateCount: Number(info?.result?.pending_update_count || 0),
+    lastErrorDate: info?.result?.last_error_date || null,
+    lastErrorMessage: info?.result?.last_error_message || null
+  };
 }
 
 function extractUsersFromUpdate(update) {
