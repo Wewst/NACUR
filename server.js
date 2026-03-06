@@ -47,7 +47,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         uptimeSec: Math.floor(process.uptime()),
-        users: getSortedUsers().length
+        users: getAllUsersSorted().length
       });
     }
 
@@ -63,11 +63,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/users" && req.method === "GET") {
       const viewerTelegramId = String(parsed.searchParams.get("viewerTelegramId") || "").trim();
-      return sendJson(res, 200, { users: getSortedUsers({ viewerTelegramId }) });
+      return sendJson(res, 200, { users: getAllUsersSorted({ viewerTelegramId }) });
     }
 
     if (pathname === "/api/leaderboard" && req.method === "GET") {
-      const users = getSortedUsers();
+      const users = getRatedUsersSorted();
       return sendJson(res, 200, {
         top: users.slice(0, 3),
         bottom: [...users].reverse().slice(0, 3)
@@ -96,7 +96,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const count = await syncUsersFromPayload(body);
       persistData();
-      return sendJson(res, 200, { ok: true, upserted: count, users: getSortedUsers() });
+      return sendJson(res, 200, { ok: true, upserted: count, users: getAllUsersSorted() });
     }
 
     if (pathname === "/api/telegram/sync" && req.method === "POST") {
@@ -336,20 +336,21 @@ async function syncUsersFromPayload(body) {
   return upserted;
 }
 
-function getSortedUsers(options = {}) {
+function getRatedUsersSorted() {
+  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
+  const rated = all.filter((user) => Number(user.likes || 0) + Number(user.dislikes || 0) > 0);
+  rated.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.likes !== a.likes) return b.likes - a.likes;
+    return a.dislikes - b.dislikes;
+  });
+  return rated;
+}
+
+function getAllUsersSorted(options = {}) {
   const viewerTelegramId = String(options.viewerTelegramId || "").trim();
-  const users = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
-
-  const rated = users.filter((user) => Number(user.likes || 0) + Number(user.dislikes || 0) > 0);
-  let visible = rated;
-
-  if (viewerTelegramId && memory.usersByTelegramId[viewerTelegramId] && !isBotUserId(viewerTelegramId)) {
-    const me = memory.usersByTelegramId[viewerTelegramId];
-    const hasMe = visible.some((user) => String(user.telegram_id) === viewerTelegramId);
-    visible = hasMe ? visible : [me, ...visible];
-  }
-
-  visible.sort((a, b) => {
+  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
+  all.sort((a, b) => {
     if (viewerTelegramId) {
       const aIsViewer = String(a.telegram_id) === viewerTelegramId;
       const bIsViewer = String(b.telegram_id) === viewerTelegramId;
@@ -360,7 +361,7 @@ function getSortedUsers(options = {}) {
     if (b.likes !== a.likes) return b.likes - a.likes;
     return a.dislikes - b.dislikes;
   });
-  return visible;
+  return all;
 }
 
 function ensureVoterActivity(voterTelegramId) {
