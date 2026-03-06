@@ -1,26 +1,15 @@
 {
-  "name": "nakur-system-server",
+  "name": "nakur-backend",
   "version": "1.0.0",
-  "description": "Сервер для рейтинговой системы NAKUR SYSTEM",
+  "description": "NAKUR Telegram Mini App backend",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "node server.js"
   },
-  "keywords": [
-    "telegram",
-    "rating",
-    "api"
-  ],
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "axios": "^1.6.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+  "engines": {
+    "node": ">=18"
   }
 }
 
