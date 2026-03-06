@@ -438,6 +438,7 @@ async function applyVote(body) {
 
   const key = `${voterTelegramId}:${targetTelegramId}`;
   const existing = memory.votesByPair[key];
+  const isFirstVoteEver = countVoterVotes(voterTelegramId) === 0;
 
   if (!existing) {
     memory.votesByPair[key] = {
@@ -450,11 +451,23 @@ async function applyVote(body) {
     };
     applyUserCounters(targetUser, voteType, +1);
     persistData();
-    return { ok: true, changed: false, warning: antiSpam.warning, user: targetUser };
+    return {
+      ok: true,
+      changed: false,
+      warning: antiSpam.warning,
+      user: targetUser,
+      noticeCode: isFirstVoteEver ? "first_vote" : null
+    };
   }
 
   if (existing.value === voteType) {
-    return { ok: false, unchanged: true, warning: antiSpam.warning, message: "Vote already set" };
+    return {
+      ok: false,
+      unchanged: true,
+      warning: antiSpam.warning,
+      message: "Vote already set",
+      noticeCode: "same_vote"
+    };
   }
   if (existing.changedOnce) {
     return { ok: false, locked: true, warning: antiSpam.warning, message: "Vote already changed once" };
@@ -466,7 +479,22 @@ async function applyVote(body) {
   existing.changedOnce = true;
   existing.updatedAt = Date.now();
   persistData();
-  return { ok: true, changed: true, warning: antiSpam.warning, user: targetUser };
+  return {
+    ok: true,
+    changed: true,
+    warning: antiSpam.warning,
+    user: targetUser,
+    noticeCode: "final_change"
+  };
+}
+
+function countVoterVotes(voterTelegramId) {
+  const target = String(voterTelegramId);
+  let count = 0;
+  for (const vote of Object.values(memory.votesByPair)) {
+    if (String(vote?.voterTelegramId) === target) count += 1;
+  }
+  return count;
 }
 
 function getCommentsByTarget(targetTelegramId) {
