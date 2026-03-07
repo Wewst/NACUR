@@ -37,7 +37,8 @@ const SPAM_ALERT_TEXT = "Превышение лимита активности:
 const runtime = {
   botUserId: "",
   syncBusy: false,
-  pollBusy: false
+  pollBusy: false,
+  welcomeMessageSent: false
 };
 
 const memory = loadData();
@@ -297,16 +298,38 @@ async function bootstrapBotState() {
     setInterval(() => {
       syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
     }, 5 * 60_000);
-    return;
+  } else {
+    await pollUpdatesAndSyncUsers();
+    setInterval(() => {
+      syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
+    }, 5 * 60_000);
+    setInterval(() => {
+      pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
+    }, 12_000);
   }
+  
+  await sendWelcomeMessage().catch((error) => console.error("Welcome message failed:", error.message));
+}
 
-  await pollUpdatesAndSyncUsers();
-  setInterval(() => {
-    syncFromTelegramBotApi().catch((error) => console.error("Periodic sync failed:", error.message));
-  }, 5 * 60_000);
-  setInterval(() => {
-    pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
-  }, 12_000);
+async function sendWelcomeMessage() {
+  if (!BOT_TOKEN || !CHAT_ID || runtime.welcomeMessageSent) return;
+  try {
+    await telegramApi("sendMessage", {
+      chat_id: CHAT_ID,
+      text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
+      reply_markup: {
+        inline_keyboard: [[{
+          text: "Репутация",
+          web_app: {
+            url: "https://uiggpie-y6yk.vercel.app/"
+          }
+        }]]
+      }
+    });
+    runtime.welcomeMessageSent = true;
+  } catch (error) {
+    console.error("Failed to send welcome message:", error.message);
+  }
 }
 
 async function resolveBotUserId() {
