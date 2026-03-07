@@ -6,7 +6,7 @@ const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE";
-const CHAT_ID = String(process.env.CHAT_ID || "-5245115253");
+const CHAT_ID = String(process.env.CHAT_ID || "-5088659298");
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
@@ -945,21 +945,31 @@ async function syncFromTelegramBotApi() {
   runtime.syncBusy = true;
   try {
     await resolveBotUserId();
-    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
-    const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
-    let upserted = 0;
-
-    for (const member of admins) {
-      const tgUser = member?.user;
-      if (!tgUser?.id) continue;
-      if (String(tgUser.id) === String(runtime.botUserId)) continue;
-      const user = await upsertUser({
-        telegram_id: String(tgUser.id),
-        username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
-        telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
-        avatar: ""
-      });
-      if (user) upserted += 1;
+    let adminsUpserted = 0;
+    
+    // Try to get admins, but don't fail if bot is not admin
+    try {
+      const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
+      const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+      for (const member of admins) {
+        const tgUser = member?.user;
+        if (!tgUser?.id) continue;
+        if (String(tgUser.id) === String(runtime.botUserId)) continue;
+        const user = await upsertUser({
+          telegram_id: String(tgUser.id),
+          username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
+          telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
+          avatar: ""
+        }, { fetchAvatar: true });
+        if (user) adminsUpserted += 1;
+      }
+    } catch (adminError) {
+      const errorMsg = String(adminError.message || "");
+      if (errorMsg.includes("not enough rights") || errorMsg.includes("chat not found") || errorMsg.includes("bot is not a member")) {
+        console.log("Bot is not admin or not in group. Skipping admin sync. Users will be added from messages.");
+      } else {
+        console.error("Failed to get chat administrators:", errorMsg);
+      }
     }
 
     const pollResult = TELEGRAM_MODE === "polling"
@@ -968,11 +978,12 @@ async function syncFromTelegramBotApi() {
     persistData();
     return {
       ok: true,
-      upserted,
-      updatesUsers: pollResult.upserted,
+      upserted: adminsUpserted + (pollResult.upserted || 0),
+      adminsUpserted,
+      updatesUsers: pollResult.upserted || 0,
       note: TELEGRAM_MODE === "polling"
-        ? "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
-        : "Users are auto-added from admin list and Telegram webhook updates. Bot account is excluded."
+        ? "Users are auto-added from admin list (if available) and Telegram updates stream. Bot account is excluded."
+        : "Users are auto-added from admin list (if available) and Telegram webhook updates. Bot account is excluded."
     };
   } finally {
     runtime.syncBusy = false;
@@ -1052,7 +1063,10 @@ async function setTelegramWebhook() {
     };
   }
 
-  const payload = { url: webhookUrl };
+  const payload = { 
+    url: webhookUrl,
+    allowed_updates: ["message", "chat_member", "my_chat_member"]
+  };
   if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
   await telegramApi("setWebhook", payload);
   const info = await getTelegramWebhookInfo();
@@ -1078,7 +1092,7 @@ function extractUsersFromUpdate(update) {
   function pushFromTgUser(tgUser) {
     if (!tgUser?.id) return;
     const telegramId = String(tgUser.id);
-    if (isBotUserId(telegramId)) return;
+    if (isBotUserId(telegramId) || isHiddenAdminId(telegramId)) return;
     users.push({
       telegram_id: telegramId,
       username: tgUser.username || `${tgUser.first_name || "user"}_${telegramId}`,
@@ -1091,19 +1105,38 @@ function extractUsersFromUpdate(update) {
     return String(chat?.id || "") === String(CHAT_ID);
   }
 
+  // Extract from regular messages
   if (update?.message && chatMatches(update.message.chat)) {
     pushFromTgUser(update.message.from);
+    // Extract from reply messages
+    if (update.message.reply_to_message?.from) {
+      pushFromTgUser(update.message.reply_to_message.from);
+    }
+    // Extract from forwarded messages
+    if (update.message.forward_from) {
+      pushFromTgUser(update.message.forward_from);
+    }
+    // Extract from new chat members
     const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
     for (const member of joins) pushFromTgUser(member);
+    // Extract from left chat member
+    if (update.message.left_chat_member) {
+      pushFromTgUser(update.message.left_chat_member);
+    }
   }
+  
+  // Extract from chat_member updates
   if (update?.chat_member && chatMatches(update.chat_member.chat)) {
     pushFromTgUser(update.chat_member.from);
     pushFromTgUser(update.chat_member.new_chat_member?.user);
     pushFromTgUser(update.chat_member.old_chat_member?.user);
   }
+  
+  // Extract from my_chat_member updates
   if (update?.my_chat_member && chatMatches(update.my_chat_member.chat)) {
     pushFromTgUser(update.my_chat_member.from);
   }
+  
   return users;
 }
 
