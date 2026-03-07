@@ -37,7 +37,8 @@ const SPAM_ALERT_TEXT = "Превышение лимита активности:
 const runtime = {
   botUserId: "",
   syncBusy: false,
-  pollBusy: false
+  pollBusy: false,
+  migratedChatId: null // New CHAT_ID if group was migrated to supergroup
 };
 
 const memory = loadData();
@@ -142,6 +143,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/telegram/webhook/info" && req.method === "GET") {
       const result = await getTelegramWebhookInfo();
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/telegram/check-chat" && req.method === "GET") {
+      const result = await checkChatId();
       return sendJson(res, 200, result);
     }
 
@@ -945,8 +951,38 @@ async function syncFromTelegramBotApi() {
   runtime.syncBusy = true;
   try {
     await resolveBotUserId();
-    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
-    const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+    let currentChatId = CHAT_ID;
+    let adminsData;
+    let admins = [];
+    try {
+      adminsData = await telegramApi("getChatAdministrators", { chat_id: currentChatId });
+      admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+    } catch (error) {
+      // Handle group migration to supergroup
+      if (error.migrateToChatId) {
+        const newChatId = error.migrateToChatId;
+        runtime.migratedChatId = newChatId;
+        console.error(`⚠️  Group migrated to supergroup! Old CHAT_ID: ${currentChatId}, New CHAT_ID: ${newChatId}`);
+        console.error(`   Update your CHAT_ID environment variable to: ${newChatId}`);
+        // Try again with new chat ID
+        try {
+          currentChatId = newChatId;
+          adminsData = await telegramApi("getChatAdministrators", { chat_id: currentChatId });
+          admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+        } catch (retryError) {
+          console.error("Failed to get admins even with new CHAT_ID:", retryError.message);
+          // Continue without admins, users will be created from updates
+        }
+      } else if (error.message && error.message.includes("group chat was upgraded to a supergroup chat")) {
+        console.error("⚠️  Group was upgraded to supergroup, but new CHAT_ID not provided.");
+        console.error("   Users will be created from webhook/polling updates.");
+        console.error("   To get new CHAT_ID, call: GET /api/telegram/check-chat");
+        // Continue without admins, users will be created from updates
+      } else {
+        console.error("Failed to get chat administrators:", error.message);
+        // Continue without admins, users will be created from updates
+      }
+    }
     let upserted = 0;
 
     for (const member of admins) {
@@ -1072,6 +1108,51 @@ async function getTelegramWebhookInfo() {
   };
 }
 
+async function checkChatId() {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    return { ok: false, error: "BOT_TOKEN and CHAT_ID are required" };
+  }
+  
+  try {
+    const chatInfo = await telegramApi("getChat", { chat_id: CHAT_ID });
+    const chat = chatInfo?.result || {};
+    return {
+      ok: true,
+      currentChatId: CHAT_ID,
+      chatId: String(chat.id || ""),
+      title: chat.title || "",
+      type: chat.type || "",
+      isSupergroup: chat.type === "supergroup",
+      username: chat.username || null,
+      message: chat.type === "supergroup" 
+        ? "This is a supergroup. CHAT_ID is correct."
+        : chat.type === "group"
+        ? "This is a regular group."
+        : "Unknown chat type."
+    };
+  } catch (error) {
+    const errorMsg = String(error.message || "");
+    if (error.migrateToChatId || errorMsg.includes("group chat was upgraded to a supergroup chat")) {
+      const newChatId = error.migrateToChatId || "";
+      return {
+        ok: false,
+        error: "Group migrated to supergroup",
+        currentChatId: CHAT_ID,
+        newChatId: newChatId,
+        message: newChatId 
+          ? `Group was upgraded to supergroup. Update CHAT_ID to: ${newChatId}`
+          : "Group was upgraded to supergroup. Get new CHAT_ID from getUpdates API.",
+        help: "Send a message to the group and check: https://api.telegram.org/bot<TOKEN>/getUpdates"
+      };
+    }
+    return {
+      ok: false,
+      error: errorMsg,
+      currentChatId: CHAT_ID
+    };
+  }
+}
+
 function extractUsersFromUpdate(update) {
   const users = [];
 
@@ -1088,7 +1169,10 @@ function extractUsersFromUpdate(update) {
   }
 
   function chatMatches(chat) {
-    return String(chat?.id || "") === String(CHAT_ID);
+    if (!chat?.id) return false;
+    const chatId = String(chat.id);
+    // Match both old and new CHAT_ID (if group was migrated)
+    return chatId === String(CHAT_ID) || (runtime.migratedChatId && chatId === String(runtime.migratedChatId));
   }
 
   if (update?.message && chatMatches(update.message.chat)) {
@@ -1154,7 +1238,17 @@ function telegramApi(method, payload) {
       response.on("end", () => {
         try {
           const parsed = JSON.parse(raw);
-          if (!parsed.ok) return reject(new Error(parsed.description || `Telegram API error: ${method}`));
+          if (!parsed.ok) {
+            const errorMsg = parsed.description || `Telegram API error: ${method}`;
+            // Handle group migration to supergroup
+            if (errorMsg.includes("group chat was upgraded to a supergroup chat") && parsed.parameters?.migrate_to_chat_id) {
+              const newChatId = String(parsed.parameters.migrate_to_chat_id);
+              const migrationError = new Error(errorMsg);
+              migrationError.migrateToChatId = newChatId;
+              return reject(migrationError);
+            }
+            return reject(new Error(errorMsg));
+          }
           resolve(parsed);
         } catch (_error) {
           reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 240)}`));
