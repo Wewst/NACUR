@@ -10,7 +10,7 @@ const CHAT_ID = String(process.env.CHAT_ID || "-5293585696");
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
-const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 10);
+const SPAM_LIMIT = Number(process.env.SPAM_LIMIT || 2);
 const COMMENTS_MAX_LEN = 60;
 const VOTE_MIN_INTERVAL_MS = Number(process.env.VOTE_MIN_INTERVAL_MS || 1200);
 const HIGH_ACTIVITY_DAILY = Number(process.env.HIGH_ACTIVITY_DAILY || 80);
@@ -32,6 +32,7 @@ const CATEGORY_LABELS = {
   communication: "Коммуникация"
 };
 const HIDDEN_ADMIN_IDS = new Set(["920945194", "8050542983"]);
+const SPAM_ALERT_TEXT = "Превышение лимита активности: более 2 оценок/комментариев за минуту.";
 
 const runtime = {
   botUserId: "",
@@ -518,8 +519,10 @@ async function checkAndHandleSpam(voterUser) {
     if (!activity.warned) {
       activity.warned = true;
       warning = true;
+      await notifyAdminsAboutViolation(voterUser, "warning");
     } else {
       activity.blocked = true;
+      await notifyAdminsAboutViolation(voterUser, "blocked");
       await banUserFromGroup(voterId);
     }
   }
@@ -527,6 +530,29 @@ async function checkAndHandleSpam(voterUser) {
   if (activity.dailyCount > HIGH_ACTIVITY_DAILY) qualityFactor = 0.75;
   if (activity.dailyCount > EXTREME_ACTIVITY_DAILY) qualityFactor = 0.55;
   return { warning, blocked: activity.blocked, cooldown: false, qualityFactor };
+}
+
+async function notifyAdminsAboutViolation(user, level) {
+  if (!BOT_TOKEN) return;
+  const username = String(user?.username || `user_${user?.telegram_id || "unknown"}`);
+  const telegramId = String(user?.telegram_id || "");
+  const status = level === "blocked" ? "BLOCKED" : "WARNING";
+  const message = [
+    "NAKUR anti-spam alert",
+    `Status: ${status}`,
+    `User: @${username}`,
+    `Telegram ID: ${telegramId}`,
+    SPAM_ALERT_TEXT
+  ].join("\n");
+
+  const targets = new Set();
+  for (const adminId of HIDDEN_ADMIN_IDS) targets.add(adminId);
+  if (CHAT_ID) targets.add(CHAT_ID);
+  for (const target of targets) {
+    try {
+      await telegramApi("sendMessage", { chat_id: target, text: message });
+    } catch (_error) {}
+  }
 }
 
 async function applyVote(body) {
@@ -720,6 +746,14 @@ async function addComment(body) {
   const lockKey = `${authorTelegramId}:${targetTelegramId}`;
   const state = memory.commentStateByPair[lockKey] || null;
   const author = memory.usersByTelegramId[authorTelegramId];
+  const antiSpam = await checkAndHandleSpam(author);
+  if (antiSpam.cooldown) {
+    return { ok: false, cooldown: true, message: "Too fast. Please wait before sending another comment." };
+  }
+  if (antiSpam.blocked) {
+    persistData();
+    return { ok: false, blocked: true, message: "Commenting blocked due to suspicious mass activity." };
+  }
   if (!Array.isArray(memory.commentsByTarget[targetTelegramId])) memory.commentsByTarget[targetTelegramId] = [];
   const bucket = memory.commentsByTarget[targetTelegramId];
 
@@ -741,6 +775,7 @@ async function addComment(body) {
     return {
       ok: true,
       edited: false,
+      warning: antiSpam.warning,
       comment,
       comments: getCommentsByTarget(targetTelegramId)
     };
@@ -766,6 +801,7 @@ async function addComment(body) {
   return {
     ok: true,
     edited: true,
+    warning: antiSpam.warning,
     comment: existing,
     comments: getCommentsByTarget(targetTelegramId)
   };
@@ -818,11 +854,27 @@ function deleteVoteByAdmin(body) {
 
   let foundKey = "";
   let foundVote = null;
-  for (const key of candidates) {
-    if (!memory.votesByPair[key]) continue;
-    foundKey = key;
-    foundVote = memory.votesByPair[key];
-    break;
+  if (candidates.length) {
+    for (const key of candidates) {
+      if (!memory.votesByPair[key]) continue;
+      foundKey = key;
+      foundVote = memory.votesByPair[key];
+      break;
+    }
+  } else if (targetTelegramId) {
+    // Admin single-delete mode: remove the latest vote for target in selected category.
+    let latestTs = 0;
+    for (const [key, vote] of Object.entries(memory.votesByPair)) {
+      if (String(vote?.targetTelegramId || "") !== targetTelegramId) continue;
+      const voteCategory = normalizeCategory(vote?.category || "reliability");
+      if (voteCategory !== category) continue;
+      const ts = Number(vote?.updatedAt || vote?.createdAt || 0);
+      if (ts >= latestTs) {
+        latestTs = ts;
+        foundKey = key;
+        foundVote = vote;
+      }
+    }
   }
   if (!foundVote) return { ok: false, removed: false, message: "Vote not found" };
 
