@@ -145,6 +145,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === "/api/debug/chat-id" && req.method === "GET") {
+      return sendJson(res, 200, {
+        currentChatId: CHAT_ID,
+        botUserId: runtime.botUserId,
+        telegramMode: TELEGRAM_MODE,
+        usersCount: Object.keys(memory.usersByTelegramId || {}).length,
+        note: "Check logs for chat ID mismatches when processing updates"
+      });
+    }
+
     if (pathname === "/api/telegram/webhook" && req.method === "POST") {
       if (WEBHOOK_SECRET) {
         const secretHeader = String(req.headers["x-telegram-bot-api-secret-token"] || "");
@@ -949,8 +959,9 @@ async function syncFromTelegramBotApi() {
     try {
       const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
       admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+      console.log(`[Sync] Found ${admins.length} administrator(s) in chat ${CHAT_ID}`);
     } catch (error) {
-      console.error("Failed to get chat administrators:", error.message);
+      console.error(`[Sync] Failed to get chat administrators for ${CHAT_ID}:`, error.message);
       // Continue without admins, users will be created from updates
     }
     let upserted = 0;
@@ -965,7 +976,13 @@ async function syncFromTelegramBotApi() {
         telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
         avatar: ""
       });
-      if (user) upserted += 1;
+      if (user) {
+        upserted += 1;
+        console.log(`[Sync] Created user from admin list: ${tgUser.id} (${tgUser.username || tgUser.first_name})`);
+      }
+    }
+    if (upserted > 0) {
+      console.log(`[Sync] Total users created from admins: ${upserted}`);
     }
 
     const pollResult = TELEGRAM_MODE === "polling"
@@ -991,7 +1008,13 @@ async function ingestTelegramUpdates(payload) {
   if (!Array.isArray(updates) || !updates.length) return { ok: true, upserted: 0, skipped: true };
 
   const extracted = [];
-  for (const update of updates) extracted.push(...extractUsersFromUpdate(update));
+  for (const update of updates) {
+    const users = extractUsersFromUpdate(update);
+    if (users.length > 0) {
+      console.log(`[Webhook] Extracted ${users.length} user(s) from update ${update?.update_id || 'unknown'}`);
+    }
+    extracted.push(...users);
+  }
 
   let upserted = 0;
   const seen = new Set();
@@ -1000,7 +1023,13 @@ async function ingestTelegramUpdates(payload) {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const user = await upsertUser(entry, { fetchAvatar: true });
-    if (user) upserted += 1;
+    if (user) {
+      upserted += 1;
+      console.log(`[Webhook] Created user: ${entry.telegram_id} (${entry.username})`);
+    }
+  }
+  if (upserted > 0) {
+    console.log(`[Webhook] Total users created: ${upserted}`);
   }
   persistData();
   return { ok: true, upserted };
@@ -1022,7 +1051,11 @@ async function pollUpdatesAndSyncUsers() {
       if (typeof update?.update_id === "number" && update.update_id >= maxUpdateId) {
         maxUpdateId = update.update_id + 1;
       }
-      extracted.push(...extractUsersFromUpdate(update));
+      const users = extractUsersFromUpdate(update);
+      if (users.length > 0) {
+        console.log(`[Polling] Extracted ${users.length} user(s) from update ${update?.update_id || 'unknown'}`);
+      }
+      extracted.push(...users);
     }
 
     let upserted = 0;
@@ -1032,7 +1065,13 @@ async function pollUpdatesAndSyncUsers() {
       if (!id || seen.has(id)) continue;
       seen.add(id);
       const user = await upsertUser(entry, { fetchAvatar: true });
-      if (user) upserted += 1;
+      if (user) {
+        upserted += 1;
+        console.log(`[Polling] Created user: ${entry.telegram_id} (${entry.username})`);
+      }
+    }
+    if (updates.length > 0) {
+      console.log(`[Polling] Processed ${updates.length} update(s), created ${upserted} user(s)`);
     }
 
     memory.telegram.updatesOffset = maxUpdateId;
@@ -1084,7 +1123,7 @@ function extractUsersFromUpdate(update) {
   function pushFromTgUser(tgUser) {
     if (!tgUser?.id) return;
     const telegramId = String(tgUser.id);
-    if (isBotUserId(telegramId)) return;
+    if (isBotUserId(telegramId) || isHiddenAdminId(telegramId)) return;
     users.push({
       telegram_id: telegramId,
       username: tgUser.username || `${tgUser.first_name || "user"}_${telegramId}`,
@@ -1094,22 +1133,40 @@ function extractUsersFromUpdate(update) {
   }
 
   function chatMatches(chat) {
-    return String(chat?.id || "") === String(CHAT_ID);
+    if (!chat?.id) return false;
+    const chatId = String(chat.id);
+    const matches = chatId === String(CHAT_ID);
+    if (!matches && chatId) {
+      // Log when chat ID doesn't match (for debugging)
+      console.log(`[extractUsers] Chat ID mismatch: expected ${CHAT_ID}, got ${chatId}`);
+    }
+    return matches;
   }
 
-  if (update?.message && chatMatches(update.message.chat)) {
-    pushFromTgUser(update.message.from);
-    const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
-    for (const member of joins) pushFromTgUser(member);
+  // Extract users from messages (only from target chat)
+  if (update?.message) {
+    const chatId = String(update.message.chat?.id || "");
+    if (chatMatches(update.message.chat)) {
+      pushFromTgUser(update.message.from);
+      const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
+      for (const member of joins) pushFromTgUser(member);
+    } else if (chatId && chatId !== String(CHAT_ID)) {
+      console.log(`[extractUsers] Message from different chat: ${chatId} (expected ${CHAT_ID})`);
+    }
   }
+  
+  // Extract users from chat_member updates
   if (update?.chat_member && chatMatches(update.chat_member.chat)) {
     pushFromTgUser(update.chat_member.from);
     pushFromTgUser(update.chat_member.new_chat_member?.user);
     pushFromTgUser(update.chat_member.old_chat_member?.user);
   }
+  
+  // Extract users from my_chat_member updates
   if (update?.my_chat_member && chatMatches(update.my_chat_member.chat)) {
     pushFromTgUser(update.my_chat_member.from);
   }
+  
   return users;
 }
 
