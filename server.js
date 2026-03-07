@@ -337,21 +337,16 @@ async function sendWelcomeMessage(force = false) {
       reply_markup: {
         inline_keyboard: [[{
           text: "Репутация",
-          web_app: {
-            url: "https://uiggpie-y6yk.vercel.app"
-          }
+          url: "https://uiggpie-y6yk.vercel.app"
         }]]
       }
     };
-    console.log("[WELCOME] Sending message with payload:", JSON.stringify(payload, null, 2));
+    console.log("[WELCOME] Sending message with URL button (web_app format may not be supported)");
     const result = await telegramApi("sendMessage", payload);
     runtime.welcomeMessageSent = true;
     console.log("[WELCOME] Message sent successfully, message_id:", result?.result?.message_id);
   } catch (error) {
     console.error("[WELCOME] Failed to send welcome message:", error.message);
-    if (error.response) {
-      console.error("[WELCOME] Error response:", JSON.stringify(error.response, null, 2));
-    }
     throw error;
   }
 }
