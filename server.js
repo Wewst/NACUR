@@ -55,7 +55,12 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
 
   try {
-    if (pathname === "/" && req.method === "GET") {
+    if (pathname === "/" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end();
+        return;
+      }
       return sendJson(res, 200, {
         ok: true,
         service: "NAKUR backend",
@@ -63,7 +68,12 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (pathname === "/health" && req.method === "GET") {
+    if (pathname === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end();
+        return;
+      }
       return sendJson(res, 200, {
         ok: true,
         uptimeSec: Math.floor(process.uptime()),
