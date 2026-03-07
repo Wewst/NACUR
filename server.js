@@ -18,6 +18,12 @@ const EXTREME_ACTIVITY_DAILY = Number(process.env.EXTREME_ACTIVITY_DAILY || 120)
 const TELEGRAM_MODE = String(process.env.TELEGRAM_MODE || "webhook").toLowerCase();
 const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "");
 const DEFAULT_WEBHOOK_BASE_URL = "https://nacur.onrender.com";
+const MINI_APP_URL = String(process.env.MINI_APP_URL || "https://uiguhgpie.vercel.app/").trim();
+const MINI_APP_BUTTON_TEXT = String(process.env.MINI_APP_BUTTON_TEXT || "Репутация");
+const MINI_APP_MESSAGE_TEXT = String(
+  process.env.MINI_APP_MESSAGE_TEXT ||
+  "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров."
+);
 const WEBHOOK_BASE_URL = String(
   process.env.WEBHOOK_BASE_URL ||
   DEFAULT_WEBHOOK_BASE_URL ||
@@ -236,7 +242,7 @@ function loadData() {
         voterActivity: {},
         commentsByTarget: {},
         commentStateByPair: {},
-        telegram: { updatesOffset: 0 }
+        telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0 }
       };
     }
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -247,7 +253,9 @@ function loadData() {
       commentsByTarget: parsed.commentsByTarget || {},
       commentStateByPair: parsed.commentStateByPair || migrateCommentState(parsed.commentLocksByPair || {}),
       telegram: {
-        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0)
+        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0),
+        launchMessageSent: Boolean(parsed?.telegram?.launchMessageSent || false),
+        launchMessageId: Number(parsed?.telegram?.launchMessageId || 0)
       }
     };
   } catch (error) {
@@ -258,7 +266,7 @@ function loadData() {
       voterActivity: {},
       commentsByTarget: {},
       commentStateByPair: {},
-      telegram: { updatesOffset: 0 }
+      telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0 }
     };
   }
 }
@@ -291,6 +299,7 @@ function scheduleBootstrap() {
 
 async function bootstrapBotState() {
   await resolveBotUserId();
+  await ensureLaunchMessageOnce().catch((error) => console.error("Launch message failed:", error.message));
   await syncFromTelegramBotApi();
   if (TELEGRAM_MODE === "webhook") {
     await setTelegramWebhook().catch((error) => console.error("Webhook setup failed:", error.message));
@@ -307,6 +316,40 @@ async function bootstrapBotState() {
   setInterval(() => {
     pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
   }, 12_000);
+}
+
+async function ensureLaunchMessageOnce() {
+  if (!BOT_TOKEN || !CHAT_ID) return { ok: false, skipped: true, reason: "missing bot config" };
+  if (memory?.telegram?.launchMessageSent) {
+    return { ok: true, skipped: true, reason: "already sent", messageId: memory.telegram.launchMessageId || 0 };
+  }
+
+  const sendPayload = {
+    chat_id: CHAT_ID,
+    text: MINI_APP_MESSAGE_TEXT,
+    reply_markup: {
+      inline_keyboard: [[{ text: MINI_APP_BUTTON_TEXT, web_app: { url: MINI_APP_URL } }]]
+    }
+  };
+
+  const sent = await telegramApi("sendMessage", sendPayload);
+  const messageId = Number(sent?.result?.message_id || 0);
+  if (!messageId) throw new Error("Failed to send launch message");
+
+  try {
+    await telegramApi("pinChatMessage", {
+      chat_id: CHAT_ID,
+      message_id: messageId,
+      disable_notification: true
+    });
+  } catch (error) {
+    console.error("Pin launch message failed:", error.message);
+  }
+
+  memory.telegram.launchMessageSent = true;
+  memory.telegram.launchMessageId = messageId;
+  persistData();
+  return { ok: true, messageId };
 }
 
 async function resolveBotUserId() {
