@@ -1033,14 +1033,14 @@ async function ingestTelegramUpdates(payload) {
         try {
           await telegramApi("sendPhoto", {
             chat_id: chatId,
-            photo: "https://sun1-56.userapi.com/s/v1/ig2/AKIGY9TGweT--RQv7LsEMKLjpKyVWVRxRYc2sISQlUQCo-yJ666yzAtRcPjFdiCThwAFNvXBWPvDJ72tdI2S6Jl2.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
-            caption: "Нажмите на профиль бота"
+            photo: "https://sun9-42.userapi.com/s/v1/ig2/ABSSSzvLC1FcojHXoibxmXE0cuLYCWa6yQMxMiLY-OMAPMaC_9X0PrXaAKwboqluFJ1lznkZEE8YDbHU5W_Zg6RI.jpg?quality=95&as=32x38,48x57,72x86,108x129,160x191,240x286,360x429,480x573,540x644,640x763,720x859,1073x1280&from=bu&cs=1073x0",
+            caption: "Приветствую! Для того, чтобы открыть приложение репутации — зайдите в профиль…"
           });
           await new Promise(resolve => setTimeout(resolve, 300));
           await telegramApi("sendPhoto", {
             chat_id: chatId,
-            photo: "https://sun9-40.userapi.com/s/v1/ig2/78eaDoZe4bOFFND6eteYftapE2XS0glGwm5cpuv7eCYCJwKVRk3oD9CSFDuFFo3kX4uit9rlIxYgr70r-B6IOkSQ.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
-            caption: 'Потом нажмите на кнопку "Открыть мини приложение"'
+            photo: "https://sun9-7.userapi.com/s/v1/ig2/pk9MI0nA62PAxtPjn2Rs2xxvKuDgPwlRPZKxkTSx_Ap7eaBJxlHDycskwGYLZYIPcVfA6BOJXWMJfmJFnjAm__dJ.jpg?quality=95&as=32x45,48x68,72x101,108x152,160x225,240x338,360x507,480x676,540x760,640x901,720x1014,909x1280&from=bu&cs=909x0",
+            caption: "И нажмите на кнопку «открыть приложение» приятного пользования"
           });
         } catch (error) {
           console.error("[START] Failed to send /start response:", error.message);
