@@ -55,6 +55,14 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
 
   try {
+    if (pathname === "/" && req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        service: "NAKUR backend",
+        uptimeSec: Math.floor(process.uptime())
+      });
+    }
+
     if (pathname === "/health" && req.method === "GET") {
       return sendJson(res, 200, {
         ok: true,
@@ -1149,5 +1157,4 @@ function telegramApi(method, payload) {
     request.end();
   });
 }
-
 
