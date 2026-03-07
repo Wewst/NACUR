@@ -321,7 +321,7 @@ async function sendWelcomeMessage() {
         inline_keyboard: [[{
           text: "Репутация",
           web_app: {
-            url: "https://uiggpie-y6yk.vercel.app/"
+            url: "https://uiggpie-y6yk.vercel.app"
           }
         }]]
       }
