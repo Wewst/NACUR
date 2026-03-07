@@ -1026,6 +1026,30 @@ async function ingestTelegramUpdates(payload) {
   const updates = Array.isArray(payload) ? payload : (payload?.update_id ? [payload] : payload?.updates || []);
   if (!Array.isArray(updates) || !updates.length) return { ok: true, upserted: 0, skipped: true };
 
+  for (const update of updates) {
+    if (update?.message?.text === "/start" && update?.message?.from) {
+      const chatId = update.message.chat?.id || update.message.from?.id;
+      if (chatId) {
+        try {
+          await telegramApi("sendMessage", {
+            chat_id: chatId,
+            text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
+            reply_markup: {
+              inline_keyboard: [[{
+                text: "Открыть приложение",
+                web_app: {
+                  url: "https://uiggpie-y6yk.vercel.app"
+                }
+              }]]
+            }
+          });
+        } catch (error) {
+          console.error("[START] Failed to send /start response:", error.message);
+        }
+      }
+    }
+  }
+
   const extracted = [];
   for (const update of updates) extracted.push(...extractUsersFromUpdate(update));
 
@@ -1051,6 +1075,30 @@ async function pollUpdatesAndSyncUsers() {
     const data = await telegramApi("getUpdates", { timeout: 0, offset, allowed_updates: ["message", "chat_member", "my_chat_member"] });
     const updates = Array.isArray(data?.result) ? data.result : [];
     if (!updates.length) return { ok: true, upserted: 0 };
+
+    for (const update of updates) {
+      if (update?.message?.text === "/start" && update?.message?.from) {
+        const chatId = update.message.chat?.id || update.message.from?.id;
+        if (chatId) {
+          try {
+            await telegramApi("sendMessage", {
+              chat_id: chatId,
+              text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
+              reply_markup: {
+                inline_keyboard: [[{
+                  text: "Открыть приложение",
+                  web_app: {
+                    url: "https://uiggpie-y6yk.vercel.app"
+                  }
+                }]]
+              }
+            });
+          } catch (error) {
+            console.error("[START] Failed to send /start response:", error.message);
+          }
+        }
+      }
+    }
 
     const extracted = [];
     let maxUpdateId = offset;
