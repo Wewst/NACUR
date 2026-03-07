@@ -337,7 +337,7 @@ async function sendWelcomeMessage(force = false) {
       reply_markup: {
         inline_keyboard: [[{
           text: "Репутация",
-          url: "https://uiggpie-y6yk.vercel.app"
+          url: "https://t.me/HAKUR23Bot"
         }]]
       }
     };
