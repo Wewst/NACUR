@@ -6,7 +6,7 @@ const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE";
-const CHAT_ID = String(process.env.CHAT_ID || "-1003710214442");
+const CHAT_ID = String(process.env.CHAT_ID || "-5245115253");
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
@@ -1017,9 +1017,7 @@ async function syncFromTelegramBotApi() {
   runtime.syncBusy = true;
   try {
     await resolveBotUserId();
-    
-    // Get admins
-    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID }).catch(() => ({ result: [] }));
+    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
     const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
     let upserted = 0;
 
@@ -1032,35 +1030,8 @@ async function syncFromTelegramBotApi() {
         username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
         telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
         avatar: ""
-      }, { fetchAvatar: true });
+      });
       if (user) upserted += 1;
-    }
-
-    // Get participants from recent updates (for supergroups)
-    // Fetch recent updates to extract users from messages
-    try {
-      const updatesData = await telegramApi("getUpdates", { 
-        timeout: 1, 
-        offset: 0, 
-        limit: 100,
-        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "chat_member", "my_chat_member"] 
-      }).catch(() => ({ result: [] }));
-      
-      const updates = Array.isArray(updatesData?.result) ? updatesData.result : [];
-      const seen = new Set();
-      
-      for (const update of updates) {
-        const extracted = extractUsersFromUpdate(update);
-        for (const entry of extracted) {
-          const telegramId = String(entry.telegram_id || "");
-          if (!telegramId || seen.has(telegramId)) continue;
-          seen.add(telegramId);
-          const user = await upsertUser(entry, { fetchAvatar: true });
-          if (user) upserted += 1;
-        }
-      }
-    } catch (error) {
-      console.log("Failed to fetch users from recent updates:", error.message);
     }
 
     const pollResult = TELEGRAM_MODE === "polling"
@@ -1072,8 +1043,8 @@ async function syncFromTelegramBotApi() {
       upserted,
       updatesUsers: pollResult.upserted,
       note: TELEGRAM_MODE === "polling"
-        ? "Users are auto-added from admin list, recent messages, and Telegram updates stream. Bot account is excluded."
-        : "Users are auto-added from admin list, recent messages, and Telegram webhook updates. Bot account is excluded."
+        ? "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
+        : "Users are auto-added from admin list and Telegram webhook updates. Bot account is excluded."
     };
   } finally {
     runtime.syncBusy = false;
@@ -1107,11 +1078,7 @@ async function pollUpdatesAndSyncUsers() {
   runtime.pollBusy = true;
   try {
     const offset = Number(memory?.telegram?.updatesOffset || 0);
-    const data = await telegramApi("getUpdates", { 
-      timeout: 0, 
-      offset, 
-      allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "chat_member", "my_chat_member"] 
-    });
+    const data = await telegramApi("getUpdates", { timeout: 0, offset, allowed_updates: ["message", "chat_member", "my_chat_member"] });
     const updates = Array.isArray(data?.result) ? data.result : [];
     if (!updates.length) return { ok: true, upserted: 0 };
 
@@ -1157,10 +1124,7 @@ async function setTelegramWebhook() {
     };
   }
 
-  const payload = { 
-    url: webhookUrl,
-    allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "chat_member", "my_chat_member"]
-  };
+  const payload = { url: webhookUrl };
   if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
   await telegramApi("setWebhook", payload);
   const info = await getTelegramWebhookInfo();
@@ -1186,7 +1150,7 @@ function extractUsersFromUpdate(update) {
   function pushFromTgUser(tgUser) {
     if (!tgUser?.id) return;
     const telegramId = String(tgUser.id);
-    if (isBotUserId(telegramId) || isHiddenAdminId(telegramId)) return;
+    if (isBotUserId(telegramId)) return;
     users.push({
       telegram_id: telegramId,
       username: tgUser.username || `${tgUser.first_name || "user"}_${telegramId}`,
@@ -1196,54 +1160,22 @@ function extractUsersFromUpdate(update) {
   }
 
   function chatMatches(chat) {
-    if (!chat?.id) return false;
-    const chatId = String(chat.id);
-    return chatId === String(CHAT_ID);
+    return String(chat?.id || "") === String(CHAT_ID);
   }
 
-  // Handle regular messages (extract all users who send messages)
   if (update?.message && chatMatches(update.message.chat)) {
     pushFromTgUser(update.message.from);
     const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
     for (const member of joins) pushFromTgUser(member);
-    // Also check for forwarded messages
-    if (update.message.forward_from) pushFromTgUser(update.message.forward_from);
-    if (update.message.forward_from_chat?.id && String(update.message.forward_from_chat.id) === String(CHAT_ID)) {
-      if (update.message.forward_from_chat.username) {
-        // Channel forward, skip user extraction
-      }
-    }
   }
-
-  // Handle edited messages
-  if (update?.edited_message && chatMatches(update.edited_message.chat)) {
-    pushFromTgUser(update.edited_message.from);
-  }
-
-  // Handle channel posts (for supergroups)
-  if (update?.channel_post && chatMatches(update.channel_post.chat)) {
-    pushFromTgUser(update.channel_post.from);
-  }
-
-  // Handle edited channel posts
-  if (update?.edited_channel_post && chatMatches(update.edited_channel_post.chat)) {
-    pushFromTgUser(update.edited_channel_post.from);
-  }
-
-  // Handle chat member updates (important for supergroups)
   if (update?.chat_member && chatMatches(update.chat_member.chat)) {
     pushFromTgUser(update.chat_member.from);
     pushFromTgUser(update.chat_member.new_chat_member?.user);
     pushFromTgUser(update.chat_member.old_chat_member?.user);
   }
-
-  // Handle my_chat_member updates
   if (update?.my_chat_member && chatMatches(update.my_chat_member.chat)) {
     pushFromTgUser(update.my_chat_member.from);
-    pushFromTgUser(update.my_chat_member.new_chat_member?.user);
-    pushFromTgUser(update.my_chat_member.old_chat_member?.user);
   }
-
   return users;
 }
 
