@@ -18,12 +18,6 @@ const EXTREME_ACTIVITY_DAILY = Number(process.env.EXTREME_ACTIVITY_DAILY || 120)
 const TELEGRAM_MODE = String(process.env.TELEGRAM_MODE || "webhook").toLowerCase();
 const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "");
 const DEFAULT_WEBHOOK_BASE_URL = "https://nacur.onrender.com";
-const MINI_APP_URL = String(process.env.MINI_APP_URL || "https://uiguhgpie.vercel.app/").trim();
-const MINI_APP_BUTTON_TEXT = String(process.env.MINI_APP_BUTTON_TEXT || "Репутация");
-const MINI_APP_MESSAGE_TEXT = String(
-  process.env.MINI_APP_MESSAGE_TEXT ||
-  "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров."
-);
 const WEBHOOK_BASE_URL = String(
   process.env.WEBHOOK_BASE_URL ||
   DEFAULT_WEBHOOK_BASE_URL ||
@@ -151,11 +145,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
-    if (pathname === "/api/telegram/chat-info" && req.method === "GET") {
-      const result = await getChatInfo();
-      return sendJson(res, 200, result);
-    }
-
     if (pathname === "/api/telegram/webhook" && req.method === "POST") {
       if (WEBHOOK_SECRET) {
         const secretHeader = String(req.headers["x-telegram-bot-api-secret-token"] || "");
@@ -195,25 +184,6 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/admin/delete-user-votes" && req.method === "POST") {
       const body = await readJsonBody(req);
       const result = deleteAllVotesForTargetByAdmin(body);
-      return sendJson(res, 200, result);
-    }
-
-    if (pathname === "/api/admin/launch-message/status" && req.method === "GET") {
-      const requesterTelegramId = String(parsed.searchParams.get("requesterTelegramId") || "").trim();
-      ensureAdminRequester(requesterTelegramId);
-      return sendJson(res, 200, {
-        ok: true,
-        sent: Boolean(memory?.telegram?.launchMessageSent),
-        messageId: Number(memory?.telegram?.launchMessageId || 0),
-        lastError: String(memory?.telegram?.lastLaunchMessageError || "")
-      });
-    }
-
-    if (pathname === "/api/admin/launch-message/send" && req.method === "POST") {
-      const body = await readJsonBody(req);
-      ensureAdminRequester(String(body?.requesterTelegramId || body?.requester_telegram_id || ""));
-      const force = Boolean(body?.force);
-      const result = await ensureLaunchMessageOnce({ force });
       return sendJson(res, 200, result);
     }
 
@@ -266,7 +236,7 @@ function loadData() {
         voterActivity: {},
         commentsByTarget: {},
         commentStateByPair: {},
-        telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0, lastLaunchMessageError: "" }
+        telegram: { updatesOffset: 0 }
       };
     }
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -277,10 +247,7 @@ function loadData() {
       commentsByTarget: parsed.commentsByTarget || {},
       commentStateByPair: parsed.commentStateByPair || migrateCommentState(parsed.commentLocksByPair || {}),
       telegram: {
-        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0),
-        launchMessageSent: Boolean(parsed?.telegram?.launchMessageSent || false),
-        launchMessageId: Number(parsed?.telegram?.launchMessageId || 0),
-        lastLaunchMessageError: String(parsed?.telegram?.lastLaunchMessageError || "")
+        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0)
       }
     };
   } catch (error) {
@@ -324,7 +291,6 @@ function scheduleBootstrap() {
 
 async function bootstrapBotState() {
   await resolveBotUserId();
-  await ensureLaunchMessageOnce().catch((error) => console.error("Launch message failed:", error.message));
   await syncFromTelegramBotApi();
   if (TELEGRAM_MODE === "webhook") {
     await setTelegramWebhook().catch((error) => console.error("Webhook setup failed:", error.message));
@@ -341,67 +307,6 @@ async function bootstrapBotState() {
   setInterval(() => {
     pollUpdatesAndSyncUsers().catch((error) => console.error("Update polling failed:", error.message));
   }, 12_000);
-}
-
-async function ensureLaunchMessageOnce(options = {}) {
-  const force = Boolean(options.force);
-  if (!BOT_TOKEN || !CHAT_ID) return { ok: false, skipped: true, reason: "missing bot config" };
-  if (!force && memory?.telegram?.launchMessageSent) {
-    return { ok: true, skipped: true, reason: "already sent", messageId: memory.telegram.launchMessageId || 0 };
-  }
-
-  const sendPayload = {
-    chat_id: CHAT_ID,
-    text: MINI_APP_MESSAGE_TEXT,
-    reply_markup: {
-      inline_keyboard: [[{ text: MINI_APP_BUTTON_TEXT, web_app: { url: MINI_APP_URL } }]]
-    }
-  };
-
-  let sent;
-  try {
-    sent = await telegramApi("sendMessage", sendPayload);
-  } catch (error) {
-    const errorMsg = String(error.message || "sendMessage failed");
-    memory.telegram.lastLaunchMessageError = errorMsg;
-    persistData();
-    
-    // Check if it's a group migration error
-    if (errorMsg.includes("GROUP_MIGRATED:")) {
-      const parts = errorMsg.split(":");
-      const newChatId = parts[1] || "";
-      console.error(`⚠️  Group migrated to supergroup! New CHAT_ID: ${newChatId}`);
-      console.error(`   Update your CHAT_ID environment variable to: ${newChatId}`);
-      throw new Error(`Group migrated to supergroup. New CHAT_ID: ${newChatId}. Update your environment variable.`);
-    }
-    
-    if (errorMsg.includes("group chat was upgraded to a supergroup chat")) {
-      console.error("⚠️  Group was upgraded to supergroup. You need to get the new CHAT_ID.");
-      console.error("   To get it, send a message to the group and check getUpdates API response.");
-      console.error("   Or use: https://api.telegram.org/bot<TOKEN>/getUpdates");
-      throw new Error("Group upgraded to supergroup. Get new CHAT_ID from getUpdates API (format: -100xxxxxxxxxx)");
-    }
-    
-    throw error;
-  }
-  const messageId = Number(sent?.result?.message_id || 0);
-  if (!messageId) throw new Error("Failed to send launch message");
-
-  try {
-    await telegramApi("pinChatMessage", {
-      chat_id: CHAT_ID,
-      message_id: messageId,
-      disable_notification: true
-    });
-  } catch (error) {
-    console.error("Pin launch message failed:", error.message);
-  }
-
-  memory.telegram.launchMessageSent = true;
-  memory.telegram.launchMessageId = messageId;
-  memory.telegram.lastLaunchMessageError = "";
-  persistData();
-  return { ok: true, messageId, forced: force };
 }
 
 async function resolveBotUserId() {
@@ -1167,58 +1072,6 @@ async function getTelegramWebhookInfo() {
   };
 }
 
-async function getChatInfo() {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    return { ok: false, error: "BOT_TOKEN and CHAT_ID are required" };
-  }
-  
-  try {
-    const chatInfo = await telegramApi("getChat", { chat_id: CHAT_ID });
-    const chat = chatInfo?.result || {};
-    return {
-      ok: true,
-      currentChatId: CHAT_ID,
-      chatId: String(chat.id || ""),
-      title: chat.title || "",
-      type: chat.type || "",
-      isSupergroup: chat.type === "supergroup",
-      username: chat.username || null,
-      note: chat.type === "supergroup" 
-        ? "This is a supergroup. CHAT_ID is correct."
-        : chat.type === "group"
-        ? "This is a regular group. If you see migration errors, the group was upgraded to supergroup."
-        : "Unknown chat type."
-    };
-  } catch (error) {
-    const errorMsg = String(error.message || "");
-    if (errorMsg.includes("GROUP_MIGRATED:")) {
-      const parts = errorMsg.split(":");
-      const newChatId = parts[1] || "";
-      return {
-        ok: false,
-        error: "Group migrated to supergroup",
-        currentChatId: CHAT_ID,
-        newChatId: newChatId,
-        message: `Update CHAT_ID to: ${newChatId}`
-      };
-    }
-    if (errorMsg.includes("group chat was upgraded to a supergroup chat")) {
-      return {
-        ok: false,
-        error: "Group upgraded to supergroup",
-        currentChatId: CHAT_ID,
-        message: "Get new CHAT_ID from getUpdates API. Send a message to the group and check: https://api.telegram.org/bot<TOKEN>/getUpdates",
-        help: "Look for 'chat':{'id':-100xxxxxxxxxx} in the response"
-      };
-    }
-    return {
-      ok: false,
-      error: errorMsg,
-      currentChatId: CHAT_ID
-    };
-  }
-}
-
 function extractUsersFromUpdate(update) {
   const users = [];
 
@@ -1301,15 +1154,7 @@ function telegramApi(method, payload) {
       response.on("end", () => {
         try {
           const parsed = JSON.parse(raw);
-          if (!parsed.ok) {
-            const errorMsg = parsed.description || `Telegram API error: ${method}`;
-            // Check for supergroup migration error
-            if (errorMsg.includes("group chat was upgraded to a supergroup chat") && parsed.parameters?.migrate_to_chat_id) {
-              const newChatId = String(parsed.parameters.migrate_to_chat_id);
-              return reject(new Error(`GROUP_MIGRATED:${newChatId}:${errorMsg}`));
-            }
-            return reject(new Error(errorMsg));
-          }
+          if (!parsed.ok) return reject(new Error(parsed.description || `Telegram API error: ${method}`));
           resolve(parsed);
         } catch (_error) {
           reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 240)}`));
