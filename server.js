@@ -188,6 +188,15 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === "/api/admin/send-welcome" && req.method === "POST") {
+      try {
+        await sendWelcomeMessage(true);
+        return sendJson(res, 200, { ok: true, message: "Welcome message sent" });
+      } catch (error) {
+        return sendJson(res, 500, { ok: false, error: error.message });
+      }
+    }
+
     sendJson(res, 404, { ok: false, error: "Not found" });
   } catch (error) {
     sendJson(res, 400, { ok: false, error: error.message || "Request failed" });
@@ -308,13 +317,21 @@ async function bootstrapBotState() {
     }, 12_000);
   }
   
+  runtime.welcomeMessageSent = false;
   await sendWelcomeMessage().catch((error) => console.error("Welcome message failed:", error.message));
 }
 
-async function sendWelcomeMessage() {
-  if (!BOT_TOKEN || !CHAT_ID || runtime.welcomeMessageSent) return;
+async function sendWelcomeMessage(force = false) {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.log("[WELCOME] Skipped: BOT_TOKEN or CHAT_ID not set");
+    return;
+  }
+  if (runtime.welcomeMessageSent && !force) {
+    console.log("[WELCOME] Skipped: already sent");
+    return;
+  }
   try {
-    await telegramApi("sendMessage", {
+    const payload = {
       chat_id: CHAT_ID,
       text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
       reply_markup: {
@@ -325,10 +342,17 @@ async function sendWelcomeMessage() {
           }
         }]]
       }
-    });
+    };
+    console.log("[WELCOME] Sending message with payload:", JSON.stringify(payload, null, 2));
+    const result = await telegramApi("sendMessage", payload);
     runtime.welcomeMessageSent = true;
+    console.log("[WELCOME] Message sent successfully, message_id:", result?.result?.message_id);
   } catch (error) {
-    console.error("Failed to send welcome message:", error.message);
+    console.error("[WELCOME] Failed to send welcome message:", error.message);
+    if (error.response) {
+      console.error("[WELCOME] Error response:", JSON.stringify(error.response, null, 2));
+    }
+    throw error;
   }
 }
 
