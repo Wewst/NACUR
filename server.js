@@ -1031,17 +1031,16 @@ async function ingestTelegramUpdates(payload) {
       const chatId = update.message.chat?.id || update.message.from?.id;
       if (chatId) {
         try {
-          await telegramApi("sendMessage", {
+          await telegramApi("sendPhoto", {
             chat_id: chatId,
-            text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
-            reply_markup: {
-              inline_keyboard: [[{
-                text: "Открыть приложение",
-                web_app: {
-                  url: "https://uiggpie-y6yk.vercel.app"
-                }
-              }]]
-            }
+            photo: "https://sun1-56.userapi.com/s/v1/ig2/AKIGY9TGweT--RQv7LsEMKLjpKyVWVRxRYc2sISQlUQCo-yJ666yzAtRcPjFdiCThwAFNvXBWPvDJ72tdI2S6Jl2.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
+            caption: "Нажмите на профиль бота"
+          });
+          await new Promise(resolve => setTimeout(resolve, 300));
+          await telegramApi("sendPhoto", {
+            chat_id: chatId,
+            photo: "https://sun9-40.userapi.com/s/v1/ig2/78eaDoZe4bOFFND6eteYftapE2XS0glGwm5cpuv7eCYCJwKVRk3oD9CSFDuFFo3kX4uit9rlIxYgr70r-B6IOkSQ.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
+            caption: 'Потом нажмите на кнопку "Открыть мини приложение"'
           });
         } catch (error) {
           console.error("[START] Failed to send /start response:", error.message);
@@ -1081,17 +1080,16 @@ async function pollUpdatesAndSyncUsers() {
         const chatId = update.message.chat?.id || update.message.from?.id;
         if (chatId) {
           try {
-            await telegramApi("sendMessage", {
+            await telegramApi("sendPhoto", {
               chat_id: chatId,
-              text: "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров",
-              reply_markup: {
-                inline_keyboard: [[{
-                  text: "Открыть приложение",
-                  web_app: {
-                    url: "https://uiggpie-y6yk.vercel.app"
-                  }
-                }]]
-              }
+              photo: "https://sun1-56.userapi.com/s/v1/ig2/AKIGY9TGweT--RQv7LsEMKLjpKyVWVRxRYc2sISQlUQCo-yJ666yzAtRcPjFdiCThwAFNvXBWPvDJ72tdI2S6Jl2.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
+              caption: "Нажмите на профиль бота"
+            });
+            await new Promise(resolve => setTimeout(resolve, 300));
+            await telegramApi("sendPhoto", {
+              chat_id: chatId,
+              photo: "https://sun9-40.userapi.com/s/v1/ig2/78eaDoZe4bOFFND6eteYftapE2XS0glGwm5cpuv7eCYCJwKVRk3oD9CSFDuFFo3kX4uit9rlIxYgr70r-B6IOkSQ.jpg?quality=95&as=32x71,48x107,72x160,108x240,160x356,240x534,360x801,480x1068,540x1201,640x1423,720x1601,1080x2402,1151x2560&from=bu&cs=1151x0",
+              caption: 'Потом нажмите на кнопку "Открыть мини приложение"'
             });
           } catch (error) {
             console.error("[START] Failed to send /start response:", error.message);
