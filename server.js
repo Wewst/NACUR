@@ -31,6 +31,7 @@ const CATEGORY_LABELS = {
   product: "Качество товара",
   communication: "Коммуникация"
 };
+const HIDDEN_ADMIN_IDS = new Set(["920945194", "8050542983"]);
 
 const runtime = {
   botUserId: "",
@@ -146,6 +147,24 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/comment" && req.method === "POST") {
       const body = await readJsonBody(req);
       const result = await addComment(body);
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/admin/delete-comment" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = deleteCommentByAdmin(body);
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/admin/delete-vote" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = deleteVoteByAdmin(body);
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === "/api/admin/delete-user-votes" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const result = deleteAllVotesForTargetByAdmin(body);
       return sendJson(res, 200, result);
     }
 
@@ -287,6 +306,10 @@ function isBotUserId(telegramId) {
   return runtime.botUserId && String(runtime.botUserId) === String(telegramId);
 }
 
+function isHiddenAdminId(telegramId) {
+  return HIDDEN_ADMIN_IDS.has(String(telegramId || ""));
+}
+
 function normalizeUsername(input, fallbackTelegramId) {
   const raw = String(input || "").replace(/^@/, "").trim();
   if (raw) return raw;
@@ -419,7 +442,7 @@ async function syncUsersFromPayload(body) {
 }
 
 function getRatedUsersSorted() {
-  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
+  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id) && !isHiddenAdminId(user.telegram_id));
   const rated = all.filter((user) => Number(user.likes || 0) + Number(user.dislikes || 0) > 0);
   rated.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
@@ -431,7 +454,7 @@ function getRatedUsersSorted() {
 
 function getAllUsersSorted(options = {}) {
   const viewerTelegramId = String(options.viewerTelegramId || "").trim();
-  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id));
+  const all = Object.values(memory.usersByTelegramId).filter((user) => !isBotUserId(user.telegram_id) && !isHiddenAdminId(user.telegram_id));
   all.sort((a, b) => {
     if (viewerTelegramId) {
       const aIsViewer = String(a.telegram_id) === viewerTelegramId;
@@ -521,8 +544,8 @@ async function applyVote(body) {
   if (!voterTelegramId || !targetTelegramId) throw new Error("voterTelegramId and targetTelegramId are required");
   if (!["like", "dislike"].includes(voteType)) throw new Error("type must be 'like' or 'dislike'");
   if (voterTelegramId === targetTelegramId) throw new Error("Self voting is not allowed");
-  if (isBotUserId(voterTelegramId) || isBotUserId(targetTelegramId)) {
-    throw new Error("Bot account cannot vote or receive votes");
+  if (isBotUserId(voterTelegramId) || isBotUserId(targetTelegramId) || isHiddenAdminId(voterTelegramId) || isHiddenAdminId(targetTelegramId)) {
+    throw new Error("Bot/admin account cannot vote or receive votes");
   }
 
   const voterUser = await upsertUser({
@@ -656,7 +679,8 @@ function getTransparencyBlock(viewerTelegramId) {
     categories: CATEGORY_LABELS,
     oneChangeRule: "Каждую оценку можно изменить только один раз",
     qualityRule: "Чрезмерная активность снижает вес оценки и может привести к блокировке",
-    qualityPreview
+    qualityPreview,
+    adminModeration: isHiddenAdminId(viewerTelegramId)
   };
 }
 
@@ -674,7 +698,9 @@ async function addComment(body) {
 
   if (!authorTelegramId || !targetTelegramId) throw new Error("authorTelegramId and targetTelegramId are required");
   if (authorTelegramId === targetTelegramId) throw new Error("Self comment is not allowed");
-  if (isBotUserId(authorTelegramId) || isBotUserId(targetTelegramId)) throw new Error("Bot account is excluded");
+  if (isBotUserId(authorTelegramId) || isBotUserId(targetTelegramId) || isHiddenAdminId(authorTelegramId) || isHiddenAdminId(targetTelegramId)) {
+    throw new Error("Bot/admin account is excluded");
+  }
   if (!text) throw new Error("Comment text is required");
   if (text.length > COMMENTS_MAX_LEN) throw new Error(`Comment is too long (max ${COMMENTS_MAX_LEN})`);
 
@@ -743,6 +769,100 @@ async function addComment(body) {
     comment: existing,
     comments: getCommentsByTarget(targetTelegramId)
   };
+}
+
+function ensureAdminRequester(requesterTelegramId) {
+  const id = String(requesterTelegramId || "").trim();
+  if (!isHiddenAdminId(id)) throw new Error("Admin access required");
+}
+
+function deleteCommentByAdmin(body) {
+  const requesterTelegramId = String(body?.requesterTelegramId || body?.requester_telegram_id || "").trim();
+  const commentId = String(body?.commentId || body?.comment_id || "").trim();
+  ensureAdminRequester(requesterTelegramId);
+  if (!commentId) throw new Error("commentId is required");
+
+  let removed = false;
+  for (const targetId of Object.keys(memory.commentsByTarget)) {
+    const list = Array.isArray(memory.commentsByTarget[targetId]) ? memory.commentsByTarget[targetId] : [];
+    const index = list.findIndex((item) => String(item.id) === commentId);
+    if (index === -1) continue;
+    list.splice(index, 1);
+    memory.commentsByTarget[targetId] = list;
+    removed = true;
+  }
+  if (!removed) return { ok: false, removed: false, message: "Comment not found" };
+
+  for (const pairKey of Object.keys(memory.commentStateByPair || {})) {
+    const state = memory.commentStateByPair[pairKey];
+    if (String(state?.commentId || "") === commentId) delete memory.commentStateByPair[pairKey];
+  }
+  persistData();
+  return { ok: true, removed: true };
+}
+
+function deleteVoteByAdmin(body) {
+  const requesterTelegramId = String(body?.requesterTelegramId || body?.requester_telegram_id || "").trim();
+  const voteKey = String(body?.voteKey || body?.vote_key || "").trim();
+  const voterTelegramId = String(body?.voterTelegramId || body?.voter_telegram_id || "").trim();
+  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
+  const category = normalizeCategory(body?.category || body?.voteCategory || "reliability");
+  ensureAdminRequester(requesterTelegramId);
+
+  const candidates = [];
+  if (voteKey) candidates.push(voteKey);
+  if (voterTelegramId && targetTelegramId) {
+    candidates.push(`${voterTelegramId}:${targetTelegramId}:${category}`);
+    if (category === "reliability") candidates.push(`${voterTelegramId}:${targetTelegramId}`);
+  }
+
+  let foundKey = "";
+  let foundVote = null;
+  for (const key of candidates) {
+    if (!memory.votesByPair[key]) continue;
+    foundKey = key;
+    foundVote = memory.votesByPair[key];
+    break;
+  }
+  if (!foundVote) return { ok: false, removed: false, message: "Vote not found" };
+
+  const target = memory.usersByTelegramId[String(foundVote.targetTelegramId || "")];
+  if (target) {
+    const voteCategory = normalizeCategory(foundVote.category || "reliability");
+    const voteWeight = Number(foundVote.weight || 1);
+    applyUserCounters(target, foundVote.value, -1, voteCategory, voteWeight);
+  }
+  delete memory.votesByPair[foundKey];
+  persistData();
+  return { ok: true, removed: true };
+}
+
+function deleteAllVotesForTargetByAdmin(body) {
+  const requesterTelegramId = String(body?.requesterTelegramId || body?.requester_telegram_id || "").trim();
+  const targetTelegramId = String(body?.targetTelegramId || body?.target_telegram_id || "").trim();
+  ensureAdminRequester(requesterTelegramId);
+  if (!targetTelegramId) throw new Error("targetTelegramId is required");
+
+  let removedCount = 0;
+  for (const key of Object.keys(memory.votesByPair)) {
+    const vote = memory.votesByPair[key];
+    if (String(vote?.targetTelegramId || "") !== targetTelegramId) continue;
+    removedCount += 1;
+    delete memory.votesByPair[key];
+  }
+
+  const target = memory.usersByTelegramId[targetTelegramId];
+  if (target) {
+    ensureUserReputation(target);
+    for (const categoryName of REPUTATION_CATEGORIES) {
+      target.reputation[categoryName].likes = 0;
+      target.reputation[categoryName].dislikes = 0;
+      target.reputation[categoryName].weighted_score = 0;
+    }
+    recalcUserTotals(target);
+  }
+  persistData();
+  return { ok: true, removedCount };
 }
 
 async function syncFromTelegramBotApi() {
