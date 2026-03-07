@@ -193,6 +193,25 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === "/api/admin/launch-message/status" && req.method === "GET") {
+      const requesterTelegramId = String(parsed.searchParams.get("requesterTelegramId") || "").trim();
+      ensureAdminRequester(requesterTelegramId);
+      return sendJson(res, 200, {
+        ok: true,
+        sent: Boolean(memory?.telegram?.launchMessageSent),
+        messageId: Number(memory?.telegram?.launchMessageId || 0),
+        lastError: String(memory?.telegram?.lastLaunchMessageError || "")
+      });
+    }
+
+    if (pathname === "/api/admin/launch-message/send" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      ensureAdminRequester(String(body?.requesterTelegramId || body?.requester_telegram_id || ""));
+      const force = Boolean(body?.force);
+      const result = await ensureLaunchMessageOnce({ force });
+      return sendJson(res, 200, result);
+    }
+
     sendJson(res, 404, { ok: false, error: "Not found" });
   } catch (error) {
     sendJson(res, 400, { ok: false, error: error.message || "Request failed" });
@@ -242,7 +261,7 @@ function loadData() {
         voterActivity: {},
         commentsByTarget: {},
         commentStateByPair: {},
-        telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0 }
+        telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0, lastLaunchMessageError: "" }
       };
     }
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -255,7 +274,8 @@ function loadData() {
       telegram: {
         updatesOffset: Number(parsed?.telegram?.updatesOffset || 0),
         launchMessageSent: Boolean(parsed?.telegram?.launchMessageSent || false),
-        launchMessageId: Number(parsed?.telegram?.launchMessageId || 0)
+        launchMessageId: Number(parsed?.telegram?.launchMessageId || 0),
+        lastLaunchMessageError: String(parsed?.telegram?.lastLaunchMessageError || "")
       }
     };
   } catch (error) {
@@ -266,7 +286,7 @@ function loadData() {
       voterActivity: {},
       commentsByTarget: {},
       commentStateByPair: {},
-      telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0 }
+      telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0, lastLaunchMessageError: "" }
     };
   }
 }
@@ -318,9 +338,10 @@ async function bootstrapBotState() {
   }, 12_000);
 }
 
-async function ensureLaunchMessageOnce() {
+async function ensureLaunchMessageOnce(options = {}) {
+  const force = Boolean(options.force);
   if (!BOT_TOKEN || !CHAT_ID) return { ok: false, skipped: true, reason: "missing bot config" };
-  if (memory?.telegram?.launchMessageSent) {
+  if (!force && memory?.telegram?.launchMessageSent) {
     return { ok: true, skipped: true, reason: "already sent", messageId: memory.telegram.launchMessageId || 0 };
   }
 
@@ -332,7 +353,14 @@ async function ensureLaunchMessageOnce() {
     }
   };
 
-  const sent = await telegramApi("sendMessage", sendPayload);
+  let sent;
+  try {
+    sent = await telegramApi("sendMessage", sendPayload);
+  } catch (error) {
+    memory.telegram.lastLaunchMessageError = String(error.message || "sendMessage failed");
+    persistData();
+    throw error;
+  }
   const messageId = Number(sent?.result?.message_id || 0);
   if (!messageId) throw new Error("Failed to send launch message");
 
@@ -348,8 +376,9 @@ async function ensureLaunchMessageOnce() {
 
   memory.telegram.launchMessageSent = true;
   memory.telegram.launchMessageId = messageId;
+  memory.telegram.lastLaunchMessageError = "";
   persistData();
-  return { ok: true, messageId };
+  return { ok: true, messageId, forced: force };
 }
 
 async function resolveBotUserId() {
