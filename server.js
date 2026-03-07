@@ -6,7 +6,7 @@ const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 3000);
 const BOT_TOKEN = process.env.BOT_TOKEN || "8783132263:AAE5-IFCh01RodVuyYUn8g2gaMJ_N_MkfnE";
-const CHAT_ID = String(process.env.CHAT_ID || "-4968704092");
+const CHAT_ID = String(process.env.CHAT_ID || "-1003710214442");
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 const DATA_FILE = path.join(__dirname, "data.json");
 const SPAM_WINDOW_MS = Number(process.env.SPAM_WINDOW_MS || 60_000);
