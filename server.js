@@ -149,10 +149,12 @@ const server = http.createServer(async (req, res) => {
       if (WEBHOOK_SECRET) {
         const secretHeader = String(req.headers["x-telegram-bot-api-secret-token"] || "");
         if (secretHeader !== WEBHOOK_SECRET) {
+          console.log("[WEBHOOK] Invalid secret token");
           return sendJson(res, 401, { ok: false, error: "Invalid webhook secret" });
         }
       }
       const body = await readJsonBody(req);
+      console.log(`[WEBHOOK] Received webhook request, payload keys: ${Object.keys(body).join(", ")}`);
       const result = await ingestTelegramUpdates(body);
       return sendJson(res, 200, result);
     }
@@ -193,8 +195,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`NAKUR backend listening on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`NAKUR backend listening on port ${PORT} (0.0.0.0)`);
 });
 
 function setCorsHeaders(res) {
@@ -965,10 +967,11 @@ async function syncFromTelegramBotApi() {
       }
     } catch (adminError) {
       const errorMsg = String(adminError.message || "");
-      if (errorMsg.includes("not enough rights") || errorMsg.includes("chat not found") || errorMsg.includes("bot is not a member")) {
-        console.log("Bot is not admin or not in group. Skipping admin sync. Users will be added from messages.");
+      if (errorMsg.includes("not enough rights") || errorMsg.includes("chat not found") || errorMsg.includes("bot is not a member") || errorMsg.includes("group chat was upgraded to a supergroup chat")) {
+        console.log(`[SYNC] Bot is not admin or group access issue. Skipping admin sync. Error: ${errorMsg}`);
+        console.log(`[SYNC] Users will be added from messages/webhook updates. CHAT_ID: ${CHAT_ID}`);
       } else {
-        console.error("Failed to get chat administrators:", errorMsg);
+        console.error(`[SYNC] Failed to get chat administrators: ${errorMsg}`);
       }
     }
 
@@ -993,10 +996,20 @@ async function syncFromTelegramBotApi() {
 async function ingestTelegramUpdates(payload) {
   await resolveBotUserId();
   const updates = Array.isArray(payload) ? payload : (payload?.update_id ? [payload] : payload?.updates || []);
-  if (!Array.isArray(updates) || !updates.length) return { ok: true, upserted: 0, skipped: true };
+  if (!Array.isArray(updates) || !updates.length) {
+    console.log("[WEBHOOK] No updates in payload");
+    return { ok: true, upserted: 0, skipped: true };
+  }
 
+  console.log(`[WEBHOOK] Received ${updates.length} update(s)`);
   const extracted = [];
-  for (const update of updates) extracted.push(...extractUsersFromUpdate(update));
+  for (const update of updates) {
+    const users = extractUsersFromUpdate(update);
+    if (users.length > 0) {
+      console.log(`[WEBHOOK] Extracted ${users.length} user(s) from update ${update.update_id || "unknown"}`);
+      extracted.push(...users);
+    }
+  }
 
   let upserted = 0;
   const seen = new Set();
@@ -1005,9 +1018,15 @@ async function ingestTelegramUpdates(payload) {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const user = await upsertUser(entry, { fetchAvatar: true });
-    if (user) upserted += 1;
+    if (user) {
+      upserted += 1;
+      console.log(`[WEBHOOK] Upserted user: @${user.username || "unknown"} (${id})`);
+    }
   }
-  persistData();
+  if (upserted > 0) {
+    persistData();
+    console.log(`[WEBHOOK] Total users upserted: ${upserted}`);
+  }
   return { ok: true, upserted };
 }
 
@@ -1068,8 +1087,10 @@ async function setTelegramWebhook() {
     allowed_updates: ["message", "chat_member", "my_chat_member"]
   };
   if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
+  console.log(`[WEBHOOK] Setting webhook URL: ${webhookUrl}`);
   await telegramApi("setWebhook", payload);
   const info = await getTelegramWebhookInfo();
+  console.log(`[WEBHOOK] Webhook set successfully. URL: ${info.url || "none"}, Pending updates: ${info.pendingUpdateCount || 0}`);
   return { ok: true, webhookUrl, info };
 }
 
