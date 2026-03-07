@@ -149,12 +149,10 @@ const server = http.createServer(async (req, res) => {
       if (WEBHOOK_SECRET) {
         const secretHeader = String(req.headers["x-telegram-bot-api-secret-token"] || "");
         if (secretHeader !== WEBHOOK_SECRET) {
-          console.log("[WEBHOOK] Invalid secret token");
           return sendJson(res, 401, { ok: false, error: "Invalid webhook secret" });
         }
       }
       const body = await readJsonBody(req);
-      console.log(`[WEBHOOK] Received webhook request, payload keys: ${Object.keys(body).join(", ")}`);
       const result = await ingestTelegramUpdates(body);
       return sendJson(res, 200, result);
     }
@@ -195,8 +193,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`NAKUR backend listening on port ${PORT} (0.0.0.0)`);
+server.listen(PORT, () => {
+  console.log(`NAKUR backend listening on port ${PORT}`);
 });
 
 function setCorsHeaders(res) {
@@ -947,32 +945,21 @@ async function syncFromTelegramBotApi() {
   runtime.syncBusy = true;
   try {
     await resolveBotUserId();
-    let adminsUpserted = 0;
-    
-    // Try to get admins, but don't fail if bot is not admin
-    try {
-      const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
-      const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
-      for (const member of admins) {
-        const tgUser = member?.user;
-        if (!tgUser?.id) continue;
-        if (String(tgUser.id) === String(runtime.botUserId)) continue;
-        const user = await upsertUser({
-          telegram_id: String(tgUser.id),
-          username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
-          telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
-          avatar: ""
-        }, { fetchAvatar: true });
-        if (user) adminsUpserted += 1;
-      }
-    } catch (adminError) {
-      const errorMsg = String(adminError.message || "");
-      if (errorMsg.includes("not enough rights") || errorMsg.includes("chat not found") || errorMsg.includes("bot is not a member") || errorMsg.includes("group chat was upgraded to a supergroup chat")) {
-        console.log(`[SYNC] Bot is not admin or group access issue. Skipping admin sync. Error: ${errorMsg}`);
-        console.log(`[SYNC] Users will be added from messages/webhook updates. CHAT_ID: ${CHAT_ID}`);
-      } else {
-        console.error(`[SYNC] Failed to get chat administrators: ${errorMsg}`);
-      }
+    const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
+    const admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
+    let upserted = 0;
+
+    for (const member of admins) {
+      const tgUser = member?.user;
+      if (!tgUser?.id) continue;
+      if (String(tgUser.id) === String(runtime.botUserId)) continue;
+      const user = await upsertUser({
+        telegram_id: String(tgUser.id),
+        username: tgUser.username || `${tgUser.first_name || "user"}_${tgUser.id}`,
+        telegram_name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "),
+        avatar: ""
+      });
+      if (user) upserted += 1;
     }
 
     const pollResult = TELEGRAM_MODE === "polling"
@@ -981,12 +968,11 @@ async function syncFromTelegramBotApi() {
     persistData();
     return {
       ok: true,
-      upserted: adminsUpserted + (pollResult.upserted || 0),
-      adminsUpserted,
-      updatesUsers: pollResult.upserted || 0,
+      upserted,
+      updatesUsers: pollResult.upserted,
       note: TELEGRAM_MODE === "polling"
-        ? "Users are auto-added from admin list (if available) and Telegram updates stream. Bot account is excluded."
-        : "Users are auto-added from admin list (if available) and Telegram webhook updates. Bot account is excluded."
+        ? "Users are auto-added from admin list and Telegram updates stream. Bot account is excluded."
+        : "Users are auto-added from admin list and Telegram webhook updates. Bot account is excluded."
     };
   } finally {
     runtime.syncBusy = false;
@@ -996,20 +982,10 @@ async function syncFromTelegramBotApi() {
 async function ingestTelegramUpdates(payload) {
   await resolveBotUserId();
   const updates = Array.isArray(payload) ? payload : (payload?.update_id ? [payload] : payload?.updates || []);
-  if (!Array.isArray(updates) || !updates.length) {
-    console.log("[WEBHOOK] No updates in payload");
-    return { ok: true, upserted: 0, skipped: true };
-  }
+  if (!Array.isArray(updates) || !updates.length) return { ok: true, upserted: 0, skipped: true };
 
-  console.log(`[WEBHOOK] Received ${updates.length} update(s)`);
   const extracted = [];
-  for (const update of updates) {
-    const users = extractUsersFromUpdate(update);
-    if (users.length > 0) {
-      console.log(`[WEBHOOK] Extracted ${users.length} user(s) from update ${update.update_id || "unknown"}`);
-      extracted.push(...users);
-    }
-  }
+  for (const update of updates) extracted.push(...extractUsersFromUpdate(update));
 
   let upserted = 0;
   const seen = new Set();
@@ -1018,15 +994,9 @@ async function ingestTelegramUpdates(payload) {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const user = await upsertUser(entry, { fetchAvatar: true });
-    if (user) {
-      upserted += 1;
-      console.log(`[WEBHOOK] Upserted user: @${user.username || "unknown"} (${id})`);
-    }
+    if (user) upserted += 1;
   }
-  if (upserted > 0) {
-    persistData();
-    console.log(`[WEBHOOK] Total users upserted: ${upserted}`);
-  }
+  persistData();
   return { ok: true, upserted };
 }
 
@@ -1082,15 +1052,10 @@ async function setTelegramWebhook() {
     };
   }
 
-  const payload = { 
-    url: webhookUrl,
-    allowed_updates: ["message", "chat_member", "my_chat_member"]
-  };
+  const payload = { url: webhookUrl };
   if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
-  console.log(`[WEBHOOK] Setting webhook URL: ${webhookUrl}`);
   await telegramApi("setWebhook", payload);
   const info = await getTelegramWebhookInfo();
-  console.log(`[WEBHOOK] Webhook set successfully. URL: ${info.url || "none"}, Pending updates: ${info.pendingUpdateCount || 0}`);
   return { ok: true, webhookUrl, info };
 }
 
@@ -1113,7 +1078,7 @@ function extractUsersFromUpdate(update) {
   function pushFromTgUser(tgUser) {
     if (!tgUser?.id) return;
     const telegramId = String(tgUser.id);
-    if (isBotUserId(telegramId) || isHiddenAdminId(telegramId)) return;
+    if (isBotUserId(telegramId)) return;
     users.push({
       telegram_id: telegramId,
       username: tgUser.username || `${tgUser.first_name || "user"}_${telegramId}`,
@@ -1126,38 +1091,19 @@ function extractUsersFromUpdate(update) {
     return String(chat?.id || "") === String(CHAT_ID);
   }
 
-  // Extract from regular messages
   if (update?.message && chatMatches(update.message.chat)) {
     pushFromTgUser(update.message.from);
-    // Extract from reply messages
-    if (update.message.reply_to_message?.from) {
-      pushFromTgUser(update.message.reply_to_message.from);
-    }
-    // Extract from forwarded messages
-    if (update.message.forward_from) {
-      pushFromTgUser(update.message.forward_from);
-    }
-    // Extract from new chat members
     const joins = Array.isArray(update.message.new_chat_members) ? update.message.new_chat_members : [];
     for (const member of joins) pushFromTgUser(member);
-    // Extract from left chat member
-    if (update.message.left_chat_member) {
-      pushFromTgUser(update.message.left_chat_member);
-    }
   }
-  
-  // Extract from chat_member updates
   if (update?.chat_member && chatMatches(update.chat_member.chat)) {
     pushFromTgUser(update.chat_member.from);
     pushFromTgUser(update.chat_member.new_chat_member?.user);
     pushFromTgUser(update.chat_member.old_chat_member?.user);
   }
-  
-  // Extract from my_chat_member updates
   if (update?.my_chat_member && chatMatches(update.my_chat_member.chat)) {
     pushFromTgUser(update.my_chat_member.from);
   }
-  
   return users;
 }
 
