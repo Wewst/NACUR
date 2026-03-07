@@ -354,7 +354,21 @@ async function ensureLaunchMessageOnce() {
     
     return { ok: true, messageId };
   } catch (error) {
-    console.error("Failed to send launch message:", error.message);
+    const errorMsg = String(error.message || "");
+    if (error.migrateToChatId || errorMsg.includes("group chat was upgraded to a supergroup chat")) {
+      const newChatId = error.migrateToChatId || "";
+      console.error("⚠️  Group migrated to supergroup!");
+      console.error(`   Current CHAT_ID: ${CHAT_ID}`);
+      if (newChatId) {
+        console.error(`   New CHAT_ID: ${newChatId}`);
+        console.error(`   Update your CHAT_ID environment variable to: ${newChatId}`);
+      } else {
+        console.error("   New CHAT_ID not provided. Get it from:");
+        console.error("   https://api.telegram.org/bot<TOKEN>/getUpdates");
+      }
+      throw new Error(`Group migrated to supergroup. New CHAT_ID: ${newChatId || "get from getUpdates"}`);
+    }
+    console.error("Failed to send launch message:", errorMsg);
     throw error;
   }
 }
@@ -990,7 +1004,21 @@ async function syncFromTelegramBotApi() {
       const adminsData = await telegramApi("getChatAdministrators", { chat_id: CHAT_ID });
       admins = Array.isArray(adminsData?.result) ? adminsData.result : [];
     } catch (error) {
-      console.error("Failed to get chat administrators:", error.message);
+      const errorMsg = String(error.message || "");
+      if (error.migrateToChatId || errorMsg.includes("group chat was upgraded to a supergroup chat")) {
+        const newChatId = error.migrateToChatId || "";
+        console.error("⚠️  Group migrated to supergroup!");
+        console.error(`   Current CHAT_ID: ${CHAT_ID}`);
+        if (newChatId) {
+          console.error(`   New CHAT_ID: ${newChatId}`);
+          console.error(`   Update your CHAT_ID environment variable to: ${newChatId}`);
+        } else {
+          console.error("   New CHAT_ID not provided. Get it from:");
+          console.error("   https://api.telegram.org/bot<TOKEN>/getUpdates");
+        }
+      } else {
+        console.error("Failed to get chat administrators:", errorMsg);
+      }
     }
     
     // Get users from recent updates (to catch all group members)
@@ -999,50 +1027,61 @@ async function syncFromTelegramBotApi() {
     if (TELEGRAM_MODE === "polling") {
       const seenUpdates = new Set();
       try {
-        let offset = 0;
-        let hasMore = true;
-        let batchCount = 0;
-        const maxBatches = 5; // Get up to 5 batches (500 updates)
-        
-        while (hasMore && batchCount < maxBatches) {
-          const updatesData = await telegramApi("getUpdates", { 
-            timeout: 1, 
-            offset: offset, 
-            limit: 100,
-            allowed_updates: ["message", "chat_member", "my_chat_member"] 
-          });
-          const updates = Array.isArray(updatesData?.result) ? updatesData.result : [];
+        // Check if webhook is active before using getUpdates
+        const webhookInfo = await telegramApi("getWebhookInfo", {}).catch(() => null);
+        if (webhookInfo?.result?.url) {
+          console.log("Webhook is active, skipping getUpdates. Users will be created from webhook events.");
+        } else {
+          let offset = 0;
+          let hasMore = true;
+          let batchCount = 0;
+          const maxBatches = 5; // Get up to 5 batches (500 updates)
           
-          if (!updates.length) {
-            hasMore = false;
-            break;
-          }
-          
-          const extracted = [];
-          for (const update of updates) {
-            if (update?.update_id && !seenUpdates.has(update.update_id)) {
-              seenUpdates.add(update.update_id);
-              extracted.push(...extractUsersFromUpdate(update));
-              if (typeof update.update_id === "number" && update.update_id >= offset) {
-                offset = update.update_id + 1;
+          while (hasMore && batchCount < maxBatches) {
+            const updatesData = await telegramApi("getUpdates", { 
+              timeout: 1, 
+              offset: offset, 
+              limit: 100,
+              allowed_updates: ["message", "chat_member", "my_chat_member"] 
+            });
+            const updates = Array.isArray(updatesData?.result) ? updatesData.result : [];
+            
+            if (!updates.length) {
+              hasMore = false;
+              break;
+            }
+            
+            const extracted = [];
+            for (const update of updates) {
+              if (update?.update_id && !seenUpdates.has(update.update_id)) {
+                seenUpdates.add(update.update_id);
+                extracted.push(...extractUsersFromUpdate(update));
+                if (typeof update.update_id === "number" && update.update_id >= offset) {
+                  offset = update.update_id + 1;
+                }
               }
             }
+            
+            const seen = new Set();
+            for (const entry of extracted) {
+              const id = String(entry.telegram_id || "");
+              if (!id || seen.has(id)) continue;
+              seen.add(id);
+              const user = await upsertUser(entry, { fetchAvatar: true });
+              if (user) updatesUsers += 1;
+            }
+            
+            batchCount += 1;
+            if (updates.length < 100) hasMore = false;
           }
-          
-          const seen = new Set();
-          for (const entry of extracted) {
-            const id = String(entry.telegram_id || "");
-            if (!id || seen.has(id)) continue;
-            seen.add(id);
-            const user = await upsertUser(entry, { fetchAvatar: true });
-            if (user) updatesUsers += 1;
-          }
-          
-          batchCount += 1;
-          if (updates.length < 100) hasMore = false;
         }
       } catch (error) {
-        console.error("Failed to get users from recent updates:", error.message);
+        const errorMsg = String(error.message || "");
+        if (errorMsg.includes("can't use getUpdates method while webhook is active")) {
+          console.log("Webhook is active, skipping getUpdates. Users will be created from webhook events.");
+        } else {
+          console.error("Failed to get users from recent updates:", errorMsg);
+        }
       }
     }
     
@@ -1108,6 +1147,12 @@ async function pollUpdatesAndSyncUsers() {
   if (runtime.pollBusy) return { ok: true, upserted: 0, skipped: true };
   runtime.pollBusy = true;
   try {
+    // Check if webhook is active
+    const webhookInfo = await telegramApi("getWebhookInfo", {}).catch(() => null);
+    if (webhookInfo?.result?.url) {
+      return { ok: true, upserted: 0, skipped: true, reason: "webhook is active" };
+    }
+    
     const offset = Number(memory?.telegram?.updatesOffset || 0);
     const data = await telegramApi("getUpdates", { timeout: 0, offset, allowed_updates: ["message", "chat_member", "my_chat_member"] });
     const updates = Array.isArray(data?.result) ? data.result : [];
@@ -1135,6 +1180,12 @@ async function pollUpdatesAndSyncUsers() {
     memory.telegram.updatesOffset = maxUpdateId;
     persistData();
     return { ok: true, upserted };
+  } catch (error) {
+    const errorMsg = String(error.message || "");
+    if (errorMsg.includes("can't use getUpdates method while webhook is active")) {
+      return { ok: true, upserted: 0, skipped: true, reason: "webhook is active" };
+    }
+    throw error;
   } finally {
     runtime.pollBusy = false;
   }
@@ -1265,7 +1316,17 @@ function telegramApi(method, payload) {
       response.on("end", () => {
         try {
           const parsed = JSON.parse(raw);
-          if (!parsed.ok) return reject(new Error(parsed.description || `Telegram API error: ${method}`));
+          if (!parsed.ok) {
+            const errorMsg = parsed.description || `Telegram API error: ${method}`;
+            // Handle group migration to supergroup
+            if (errorMsg.includes("group chat was upgraded to a supergroup chat") && parsed.parameters?.migrate_to_chat_id) {
+              const newChatId = String(parsed.parameters.migrate_to_chat_id);
+              const migrationError = new Error(errorMsg);
+              migrationError.migrateToChatId = newChatId;
+              return reject(migrationError);
+            }
+            return reject(new Error(errorMsg));
+          }
           resolve(parsed);
         } catch (_error) {
           reject(new Error(`Invalid Telegram API response: ${raw.slice(0, 240)}`));
