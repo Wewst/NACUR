@@ -24,6 +24,12 @@ const WEBHOOK_BASE_URL = String(
   process.env.RENDER_EXTERNAL_URL ||
   ""
 ).trim();
+const MINI_APP_URL = String(process.env.MINI_APP_URL || "https://uiguhgpie.vercel.app/").trim();
+const MINI_APP_MESSAGE_TEXT = String(
+  process.env.MINI_APP_MESSAGE_TEXT ||
+  "Это рейтинг участников нашей группы\nЗарабатывай репутацию и поднимайся выше в таблице лидеров"
+);
+const MINI_APP_BUTTON_TEXT = String(process.env.MINI_APP_BUTTON_TEXT || "Репутация");
 const REPUTATION_CATEGORIES = ["reliability", "response", "product", "communication"];
 const CATEGORY_LABELS = {
   reliability: "Надежность",
@@ -236,7 +242,7 @@ function loadData() {
         voterActivity: {},
         commentsByTarget: {},
         commentStateByPair: {},
-        telegram: { updatesOffset: 0 }
+        telegram: { updatesOffset: 0, launchMessageSent: false, launchMessageId: 0 }
       };
     }
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -247,7 +253,9 @@ function loadData() {
       commentsByTarget: parsed.commentsByTarget || {},
       commentStateByPair: parsed.commentStateByPair || migrateCommentState(parsed.commentLocksByPair || {}),
       telegram: {
-        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0)
+        updatesOffset: Number(parsed?.telegram?.updatesOffset || 0),
+        launchMessageSent: Boolean(parsed?.telegram?.launchMessageSent || false),
+        launchMessageId: Number(parsed?.telegram?.launchMessageId || 0)
       }
     };
   } catch (error) {
@@ -291,6 +299,7 @@ function scheduleBootstrap() {
 
 async function bootstrapBotState() {
   await resolveBotUserId();
+  await ensureLaunchMessageOnce().catch((error) => console.error("Launch message failed:", error.message));
   await syncFromTelegramBotApi();
   if (TELEGRAM_MODE === "webhook") {
     await setTelegramWebhook().catch((error) => console.error("Webhook setup failed:", error.message));
@@ -319,6 +328,35 @@ async function resolveBotUserId() {
     console.error("Failed to resolve bot id:", error.message);
   }
   return runtime.botUserId;
+}
+
+async function ensureLaunchMessageOnce() {
+  if (!BOT_TOKEN || !CHAT_ID) return { ok: false, skipped: true, reason: "missing bot config" };
+  if (memory?.telegram?.launchMessageSent) {
+    return { ok: true, skipped: true, reason: "already sent", messageId: memory.telegram.launchMessageId || 0 };
+  }
+
+  try {
+    const sent = await telegramApi("sendMessage", {
+      chat_id: CHAT_ID,
+      text: MINI_APP_MESSAGE_TEXT,
+      reply_markup: {
+        inline_keyboard: [[{ text: MINI_APP_BUTTON_TEXT, web_app: { url: MINI_APP_URL } }]]
+      }
+    });
+    
+    const messageId = Number(sent?.result?.message_id || 0);
+    if (!messageId) throw new Error("Failed to send launch message");
+
+    memory.telegram.launchMessageSent = true;
+    memory.telegram.launchMessageId = messageId;
+    persistData();
+    
+    return { ok: true, messageId };
+  } catch (error) {
+    console.error("Failed to send launch message:", error.message);
+    throw error;
+  }
 }
 
 function isBotUserId(telegramId) {
@@ -956,54 +994,56 @@ async function syncFromTelegramBotApi() {
     }
     
     // Get users from recent updates (to catch all group members)
-    // Fetch multiple batches to get more users
+    // Only use getUpdates if webhook is not active (polling mode)
     let updatesUsers = 0;
-    const seenUpdates = new Set();
-    try {
-      let offset = 0;
-      let hasMore = true;
-      let batchCount = 0;
-      const maxBatches = 5; // Get up to 5 batches (500 updates)
-      
-      while (hasMore && batchCount < maxBatches) {
-        const updatesData = await telegramApi("getUpdates", { 
-          timeout: 1, 
-          offset: offset, 
-          limit: 100,
-          allowed_updates: ["message", "chat_member", "my_chat_member"] 
-        });
-        const updates = Array.isArray(updatesData?.result) ? updatesData.result : [];
+    if (TELEGRAM_MODE === "polling") {
+      const seenUpdates = new Set();
+      try {
+        let offset = 0;
+        let hasMore = true;
+        let batchCount = 0;
+        const maxBatches = 5; // Get up to 5 batches (500 updates)
         
-        if (!updates.length) {
-          hasMore = false;
-          break;
-        }
-        
-        const extracted = [];
-        for (const update of updates) {
-          if (update?.update_id && !seenUpdates.has(update.update_id)) {
-            seenUpdates.add(update.update_id);
-            extracted.push(...extractUsersFromUpdate(update));
-            if (typeof update.update_id === "number" && update.update_id >= offset) {
-              offset = update.update_id + 1;
+        while (hasMore && batchCount < maxBatches) {
+          const updatesData = await telegramApi("getUpdates", { 
+            timeout: 1, 
+            offset: offset, 
+            limit: 100,
+            allowed_updates: ["message", "chat_member", "my_chat_member"] 
+          });
+          const updates = Array.isArray(updatesData?.result) ? updatesData.result : [];
+          
+          if (!updates.length) {
+            hasMore = false;
+            break;
+          }
+          
+          const extracted = [];
+          for (const update of updates) {
+            if (update?.update_id && !seenUpdates.has(update.update_id)) {
+              seenUpdates.add(update.update_id);
+              extracted.push(...extractUsersFromUpdate(update));
+              if (typeof update.update_id === "number" && update.update_id >= offset) {
+                offset = update.update_id + 1;
+              }
             }
           }
+          
+          const seen = new Set();
+          for (const entry of extracted) {
+            const id = String(entry.telegram_id || "");
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            const user = await upsertUser(entry, { fetchAvatar: true });
+            if (user) updatesUsers += 1;
+          }
+          
+          batchCount += 1;
+          if (updates.length < 100) hasMore = false;
         }
-        
-        const seen = new Set();
-        for (const entry of extracted) {
-          const id = String(entry.telegram_id || "");
-          if (!id || seen.has(id)) continue;
-          seen.add(id);
-          const user = await upsertUser(entry, { fetchAvatar: true });
-          if (user) updatesUsers += 1;
-        }
-        
-        batchCount += 1;
-        if (updates.length < 100) hasMore = false;
+      } catch (error) {
+        console.error("Failed to get users from recent updates:", error.message);
       }
-    } catch (error) {
-      console.error("Failed to get users from recent updates:", error.message);
     }
     
     // Get users from administrators
